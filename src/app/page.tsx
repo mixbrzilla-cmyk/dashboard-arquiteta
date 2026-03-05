@@ -57,6 +57,12 @@ type ProjetosObraRow = {
   nome_obra?: string | null;
   cliente?: string | null;
   localizacao?: string | null;
+  whatsapp_cliente?: string | null;
+  uf?: string | null;
+  padrao_cub?: string | null;
+  area_m2?: number | null;
+  cub_m2_cents?: number | null;
+  valor_previsto_cents?: number | null;
   status?: string | null;
   created_at?: string | null;
 };
@@ -83,6 +89,7 @@ type LevantamentoItem = {
 
 type DiarioEntry = {
   id: string;
+  supabaseId?: string;
   createdAt: number;
   ocorrencias: string;
   mudancas: string;
@@ -520,25 +527,64 @@ export default function Home() {
 
   async function loadProjectsFromSupabase() {
     const supabase = getSupabase();
-    const { data, error } = await supabase
-      .from("projetos_obra")
-      .select("id,nome_obra,cliente,localizacao,status,created_at")
-      .order("created_at", { ascending: false });
-    if (error) throw new Error(error.message);
+    const trySelect = async (select: string) => {
+      const { data, error } = await supabase
+        .from("projetos_obra")
+        .select(select)
+        .order("created_at", { ascending: false });
+      if (error) throw new Error(error.message);
+      return data as unknown as ProjetosObraRow[] | null;
+    };
 
-    const rows = (data as ProjetosObraRow[] | null) ?? [];
+    let rows: ProjetosObraRow[] = [];
+    try {
+      rows = (await trySelect(
+        "id,nome_obra,cliente,localizacao,whatsapp_cliente,uf,padrao_cub,area_m2,cub_m2_cents,valor_previsto_cents,status,created_at",
+      )) ?? [];
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao carregar obras";
+      if (
+        /whatsapp_cliente/i.test(msg) ||
+        /valor_previsto_cents/i.test(msg) ||
+        /padrao_cub/i.test(msg) ||
+        /area_m2/i.test(msg) ||
+        /cub_m2_cents/i.test(msg)
+      ) {
+        rows = (await trySelect("id,nome_obra,cliente,localizacao,status,created_at")) ?? [];
+      } else {
+        throw err;
+      }
+    }
+
+    console.log("Dados vindos do banco:", rows);
+
     const projects = rows
       .map<RecentProject | null>((row) => {
         const nome = String(row.nome_obra ?? "").trim();
         const cliente = String(row.cliente ?? "").trim();
         if (!nome || !cliente) return null;
         const localizacao = String(row.localizacao ?? "").trim();
+
+        const rawWhats = row.whatsapp_cliente;
+        const whatsappCliente = rawWhats != null ? String(rawWhats).trim() : "";
+
+        const valorPrevistoCents =
+          typeof row.valor_previsto_cents === "number" && Number.isFinite(row.valor_previsto_cents)
+            ? Math.round(row.valor_previsto_cents)
+            : 0;
+
         return {
           id: String(row.id),
           cliente,
+          whatsappCliente: whatsappCliente || undefined,
           projeto: nome,
           enderecoObra: localizacao || undefined,
-          valorPrevistoCents: 0,
+          uf: row.uf != null ? String(row.uf) : undefined,
+          padraoCUB: row.padrao_cub != null ? String(row.padrao_cub) : undefined,
+          areaM2: typeof row.area_m2 === "number" && Number.isFinite(row.area_m2) ? row.area_m2 : undefined,
+          cubM2Cents:
+            typeof row.cub_m2_cents === "number" && Number.isFinite(row.cub_m2_cents) ? row.cub_m2_cents : undefined,
+          valorPrevistoCents,
         };
       })
       .filter((p): p is RecentProject => p !== null);
@@ -546,13 +592,39 @@ export default function Home() {
     setRecentProjects(projects);
   }
 
-  async function insertProjectToSupabase(payload: { nome_obra: string; cliente: string; localizacao: string; status: string }) {
+  async function insertProjectToSupabase(payload: Record<string, unknown>) {
     const supabase = getSupabase();
-    const { data, error } = await supabase.from("projetos_obra").insert(payload).select("id").single();
-    return {
-      id: (data as { id: string | number } | null)?.id ?? null,
-      error,
+
+    const tryInsert = async (p: Record<string, unknown>) => {
+      const { data, error } = await supabase.from("projetos_obra").insert(p).select("id").single();
+      return {
+        id: (data as { id: string | number } | null)?.id ?? null,
+        error,
+      };
     };
+
+    try {
+      return await tryInsert(payload);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao inserir projeto";
+      if (
+        /whatsapp_cliente/i.test(msg) ||
+        /valor_previsto_cents/i.test(msg) ||
+        /padrao_cub/i.test(msg) ||
+        /area_m2/i.test(msg) ||
+        /cub_m2_cents/i.test(msg)
+      ) {
+        const fallback = { ...payload };
+        delete fallback.whatsapp_cliente;
+        delete fallback.valor_previsto_cents;
+        delete fallback.uf;
+        delete fallback.padrao_cub;
+        delete fallback.area_m2;
+        delete fallback.cub_m2_cents;
+        return await tryInsert(fallback);
+      }
+      throw err;
+    }
   }
 
   async function deleteProjectFromSupabase(id: string) {
@@ -1317,6 +1389,12 @@ export default function Home() {
           nome_obra: nomeObra,
           cliente,
           localizacao,
+          whatsapp_cliente: whatsappDigits || null,
+          uf: form.uf.trim() || null,
+          padrao_cub: form.padraoCUB.trim() || null,
+          area_m2: Number.isFinite(areaM2) && areaM2 > 0 ? areaM2 : null,
+          cub_m2_cents: Number.isFinite(cubM2Cents) && cubM2Cents > 0 ? cubM2Cents : null,
+          valor_previsto_cents: Number.isFinite(valorPrevistoCents) && valorPrevistoCents > 0 ? valorPrevistoCents : null,
           status: "ativa",
         };
 
@@ -1903,6 +1981,10 @@ export default function Home() {
       return;
     }
 
+    const project = recentProjects.find((p) => p.id === selectedProjectId) ?? null;
+    const nomeObra = project?.projeto?.trim() ?? "";
+    if (!nomeObra) return;
+
     const entry: DiarioEntry = {
       id: String(Date.now()),
       createdAt: Date.now(),
@@ -1915,7 +1997,83 @@ export default function Home() {
       return { ...prev, [selectedProjectId]: [entry, ...current] };
     });
     setDiarioForm({ ocorrencias: "", mudancas: "" });
+
+    void (async () => {
+      try {
+        const supabase = getSupabase();
+        const payload = {
+          nome_obra: nomeObra,
+          ocorrencias: entry.ocorrencias,
+          mudancas: entry.mudancas,
+        };
+        const { data, error } = await supabase.from("diario_obra").insert(payload).select("id,created_at").single();
+        if (error) {
+          alert("ERRO NO BANCO: " + error.message);
+          throw new Error(error.message);
+        }
+
+        const insertedId = (data as { id?: string | number } | null)?.id;
+        const createdAt = (data as { created_at?: string | null } | null)?.created_at;
+
+        setDiarioByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return {
+            ...prev,
+            [selectedProjectId]: current.map((e) =>
+              e.id === entry.id
+                ? {
+                    ...e,
+                    supabaseId: insertedId != null ? String(insertedId) : e.supabaseId,
+                    createdAt: createdAt ? new Date(createdAt).getTime() : e.createdAt,
+                  }
+                : e,
+            ),
+          };
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao salvar diário";
+        setProjectNotice({ kind: "error", message: `Falha ao sincronizar diário: ${msg}` });
+      }
+    })();
   }
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    if (!hasLoadedProjectsFromSupabase) return;
+
+    const project = recentProjects.find((p) => p.id === selectedProjectId) ?? null;
+    const nomeObra = project?.projeto?.trim() ?? "";
+    if (!nomeObra) return;
+
+    void (async () => {
+      try {
+        const supabase = getSupabase();
+        const { data, error } = await supabase
+          .from("diario_obra")
+          .select("id,nome_obra,ocorrencias,mudancas,created_at")
+          .eq("nome_obra", nomeObra)
+          .order("created_at", { ascending: false });
+        if (error) throw new Error(error.message);
+
+        const rows = (data as Array<{ id: string | number; ocorrencias?: string | null; mudancas?: string | null; created_at?: string | null }> | null) ?? [];
+        const entries: DiarioEntry[] = rows.map((r) => ({
+          id: `supabase-${String(r.id)}`,
+          supabaseId: String(r.id),
+          createdAt: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
+          ocorrencias: String(r.ocorrencias ?? "").trim(),
+          mudancas: String(r.mudancas ?? "").trim(),
+        }));
+
+        setDiarioByProject((prev) => ({
+          ...prev,
+          [selectedProjectId]: entries,
+        }));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao carregar diário";
+        setProjectNotice({ kind: "error", message: `Falha ao carregar diário: ${msg}` });
+      }
+    })();
+  }, [hasLoadedProjectsFromSupabase, recentProjects, selectedProjectId]);
 
   return (
     <div className="min-h-screen bg-[#FFFFFF] text-zinc-800">
