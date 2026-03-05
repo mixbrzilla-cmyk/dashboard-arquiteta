@@ -52,6 +52,15 @@ type RecentProject = {
   valorPrevistoCents: number;
 };
 
+type ProjetosObraRow = {
+  id: string | number;
+  nome_obra?: string | null;
+  cliente?: string | null;
+  localizacao?: string | null;
+  status?: string | null;
+  created_at?: string | null;
+};
+
 type WorkTab =
   | "prioridades"
   | "diario"
@@ -150,6 +159,7 @@ type AgendaEvent = {
 const STORAGE_KEY = "sistema-arquiteta:recent-projects";
 const AGENDA_STORAGE_KEY = "sistema-arquiteta:agenda-events";
 const STORES_STORAGE_KEY = "sistema-arquiteta:store-domains";
+const SELECTED_PROJECT_STORAGE_KEY = "sistema-arquiteta:selected-project-id";
 
 const SEED_PROJECTS: RecentProject[] = [];
 
@@ -414,6 +424,8 @@ export default function Home() {
   const [hasLoadedFromStorage, setHasLoadedFromStorage] = useState(false);
   const [hasLoadedAgendaFromStorage, setHasLoadedAgendaFromStorage] = useState(false);
 
+  const [hasLoadedProjectsFromSupabase, setHasLoadedProjectsFromSupabase] = useState(false);
+
   const [hasLoadedMaterialsFromSupabase, setHasLoadedMaterialsFromSupabase] = useState(false);
   const [hasLoadedTeamFromSupabase, setHasLoadedTeamFromSupabase] = useState(false);
 
@@ -473,6 +485,63 @@ export default function Home() {
       }
       throw err;
     }
+  }
+
+  async function loadProjectsFromSupabase() {
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+      .from("projetos_obra")
+      .select("id,nome_obra,cliente,localizacao,status,created_at")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+
+    const rows = (data as ProjetosObraRow[] | null) ?? [];
+    const projects = rows
+      .map<RecentProject | null>((row) => {
+        const nome = String(row.nome_obra ?? "").trim();
+        const cliente = String(row.cliente ?? "").trim();
+        if (!nome || !cliente) return null;
+        const localizacao = String(row.localizacao ?? "").trim();
+        return {
+          id: String(row.id),
+          cliente,
+          projeto: nome,
+          enderecoObra: localizacao || undefined,
+          valorPrevistoCents: 0,
+        };
+      })
+      .filter((p): p is RecentProject => p !== null);
+
+    setRecentProjects(projects);
+
+    if (projects.length === 0) {
+      try {
+        const stored = window.localStorage.getItem(STORAGE_KEY);
+        if (!stored) return;
+        const parsed: unknown = JSON.parse(stored);
+        if (!Array.isArray(parsed)) return;
+        const cleaned = parsed
+          .map((item) => coerceRecentProject(item))
+          .filter((item): item is RecentProject => Boolean(item));
+        if (cleaned.length > 0) {
+          setRecentProjects(cleaned);
+        }
+      } catch {
+      }
+    }
+  }
+
+  async function insertProjectToSupabase(payload: { nome_obra: string; cliente: string; localizacao: string; status: string }) {
+    const supabase = getSupabase();
+    const { data, error } = await supabase.from("projetos_obra").insert(payload).select("id").single();
+    if (error) throw new Error(error.message);
+    return (data as { id: string | number } | null)?.id ?? null;
+  }
+
+  async function deleteProjectFromSupabase(id: string) {
+    const supabase = getSupabase();
+    const { error } = await supabase.from("projetos_obra").delete().eq("id", id);
+    if (error) throw new Error(error.message);
   }
 
   async function updateMaterialFieldsInSupabase(material: MaterialItem, patch: { quantidade?: number; preco_unitario?: number }) {
@@ -1024,28 +1093,42 @@ export default function Home() {
   }, [isModalOpen]);
 
   useEffect(() => {
+    setHasLoadedFromStorage(true);
+  }, []);
+
+  useEffect(() => {
+    if (hasLoadedProjectsFromSupabase) return;
+    void (async () => {
+      try {
+        await loadProjectsFromSupabase();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao carregar obras do Supabase";
+        setProjectNotice({ kind: "error", message: `Falha ao carregar obras do Supabase: ${msg}` });
+      } finally {
+        setHasLoadedProjectsFromSupabase(true);
+      }
+    })();
+  }, [hasLoadedProjectsFromSupabase]);
+
+  useEffect(() => {
     try {
-      const stored = window.localStorage.getItem(STORAGE_KEY);
-      if (!stored) {
-        setHasLoadedFromStorage(true);
-        return;
-      }
-      const parsed: unknown = JSON.parse(stored);
-      if (!Array.isArray(parsed)) {
-        setHasLoadedFromStorage(true);
-        return;
-      }
-      const cleaned = parsed
-        .map((item) => coerceRecentProject(item))
-        .filter((item): item is RecentProject => Boolean(item));
-      if (cleaned.length > 0) {
-        setRecentProjects(cleaned);
-      }
+      const stored = window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
+      if (!stored) return;
+      setSelectedProjectId(stored);
     } catch {
-    } finally {
-      setHasLoadedFromStorage(true);
     }
   }, []);
+
+  useEffect(() => {
+    try {
+      if (!selectedProjectId) {
+        window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
+        return;
+      }
+      window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, selectedProjectId);
+    } catch {
+    }
+  }, [selectedProjectId]);
 
   useEffect(() => {
     try {
@@ -1060,11 +1143,7 @@ export default function Home() {
 
   useEffect(() => {
     if (!hasLoadedFromStorage) return;
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(recentProjects));
-    } catch {
-    }
-  }, [recentProjects, hasLoadedFromStorage]);
+  }, [hasLoadedFromStorage]);
 
   useEffect(() => {
     try {
@@ -1120,37 +1199,66 @@ export default function Home() {
       valorPrevistoManualCents > 0 && Number.isFinite(valorPrevistoManualCents)
         ? valorPrevistoManualCents
         : Math.round(areaM2 * cubM2Cents);
-    const newProject: RecentProject = {
-      id: String(Date.now()),
-      cliente: form.cliente.trim(),
-      whatsappCliente: whatsappDigits,
-      projeto: form.projeto.trim(),
-      enderecoObra: form.enderecoObra.trim(),
-      uf: form.uf.trim(),
-      padraoCUB: form.padraoCUB.trim(),
-      areaM2,
-      cubM2Cents,
-      valorPrevistoCents,
-    };
 
-    setRecentProjects((prev) => [newProject, ...prev]);
-    closeModal();
-    setForm({
-      cliente: "",
-      whatsappCliente: "",
-      projeto: "",
-      enderecoObra: "",
-      uf: "SP",
-      padraoCUB: "R8-N",
-      areaM2: "",
-      cubM2: "",
-      valorPrevisto: "",
-    });
-    alert("Projeto cadastrado com sucesso!");
+    void (async () => {
+      try {
+        const nomeObra = form.projeto.trim();
+        const cliente = form.cliente.trim();
+        const localizacao = form.enderecoObra.trim();
+        const insertedId = await insertProjectToSupabase({
+          nome_obra: nomeObra,
+          cliente,
+          localizacao,
+          status: "ativa",
+        });
+        if (!insertedId) throw new Error("Supabase não retornou ID da obra.");
+
+        const newProject: RecentProject = {
+          id: String(insertedId),
+          cliente,
+          whatsappCliente: whatsappDigits,
+          projeto: nomeObra,
+          enderecoObra: localizacao,
+          uf: form.uf.trim(),
+          padraoCUB: form.padraoCUB.trim(),
+          areaM2,
+          cubM2Cents,
+          valorPrevistoCents,
+        };
+
+        setRecentProjects((prev) => [newProject, ...prev]);
+        setProjectNotice({ kind: "success", message: "Obra criada e sincronizada no banco de dados." });
+        closeModal();
+        setForm({
+          cliente: "",
+          whatsappCliente: "",
+          projeto: "",
+          enderecoObra: "",
+          uf: "SP",
+          padraoCUB: "R8-N",
+          areaM2: "",
+          cubM2: "",
+          valorPrevisto: "",
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao criar obra";
+        setProjectNotice({ kind: "error", message: `Falha ao criar obra no Supabase: ${msg}` });
+      }
+    })();
   }
 
   function onDeleteProject(id: string) {
     setRecentProjects((prev) => prev.filter((p) => p.id !== id));
+
+    void (async () => {
+      try {
+        await deleteProjectFromSupabase(id);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao excluir obra";
+        setProjectNotice({ kind: "error", message: `Falha ao excluir obra no Supabase: ${msg}` });
+      }
+    })();
+
     setDiarioByProject((prev) => {
       if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
       const next = { ...prev };
