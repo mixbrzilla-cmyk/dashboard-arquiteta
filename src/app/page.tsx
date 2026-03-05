@@ -158,10 +158,8 @@ type AgendaEvent = {
   subtitle: string;
 };
 
-const STORAGE_KEY = "sistema-arquiteta:recent-projects";
 const AGENDA_STORAGE_KEY = "sistema-arquiteta:agenda-events";
 const STORES_STORAGE_KEY = "sistema-arquiteta:store-domains";
-const SELECTED_PROJECT_STORAGE_KEY = "sistema-arquiteta:selected-project-id";
 
 const SEED_PROJECTS: RecentProject[] = [];
 
@@ -440,8 +438,6 @@ export default function Home() {
   const [priceSearchByMaterialId, setPriceSearchByMaterialId] = useState<
     Record<string, { status: "idle" | "loading" | "error" | "success"; results: PriceSearchResult[]; error?: string }>
   >({});
-
-  const [hasLoadedFromStorage, setHasLoadedFromStorage] = useState(false);
   const [hasLoadedAgendaFromStorage, setHasLoadedAgendaFromStorage] = useState(false);
 
   const [hasLoadedProjectsFromSupabase, setHasLoadedProjectsFromSupabase] = useState(false);
@@ -548,22 +544,6 @@ export default function Home() {
       .filter((p): p is RecentProject => p !== null);
 
     setRecentProjects(projects);
-
-    if (projects.length === 0) {
-      try {
-        const stored = window.localStorage.getItem(STORAGE_KEY);
-        if (!stored) return;
-        const parsed: unknown = JSON.parse(stored);
-        if (!Array.isArray(parsed)) return;
-        const cleaned = parsed
-          .map((item) => coerceRecentProject(item))
-          .filter((item): item is RecentProject => Boolean(item));
-        if (cleaned.length > 0) {
-          setRecentProjects(cleaned);
-        }
-      } catch {
-      }
-    }
   }
 
   async function insertProjectToSupabase(payload: { nome_obra: string; cliente: string; localizacao: string; status: string }) {
@@ -582,37 +562,37 @@ export default function Home() {
   }
 
   function onDeleteProject(id: string) {
-    setRecentProjects((prev) => prev.filter((p) => p.id !== id));
-
-    setDiarioByProject((prev) => {
-      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-
-    setMaterialsByProject((prev) => {
-      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-
-    setTeamByProject((prev) => {
-      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-
-    if (selectedProjectId === id) {
-      setSelectedProjectId(null);
-      setActiveTab("diario");
-    }
-
     void (async () => {
       try {
         await deleteProjectFromSupabase(id);
+
+        setRecentProjects((prev) => prev.filter((p) => p.id !== id));
+
+        setDiarioByProject((prev) => {
+          if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+
+        setMaterialsByProject((prev) => {
+          if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+
+        setTeamByProject((prev) => {
+          if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+          const next = { ...prev };
+          delete next[id];
+          return next;
+        });
+
+        if (selectedProjectId === id) {
+          setSelectedProjectId(null);
+          setActiveTab("diario");
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Falha ao excluir obra";
         setProjectNotice({ kind: "error", message: `Falha ao excluir obra no Supabase: ${msg}` });
@@ -887,8 +867,8 @@ export default function Home() {
   }
 
   useEffect(() => {
-    if (!hasLoadedFromStorage) return;
     if (hasLoadedMaterialsFromSupabase) return;
+    if (!hasLoadedProjectsFromSupabase) return;
 
     const load = async () => {
       try {
@@ -960,11 +940,11 @@ export default function Home() {
     };
 
     void load();
-  }, [hasLoadedFromStorage, hasLoadedMaterialsFromSupabase, recentProjects]);
+  }, [hasLoadedMaterialsFromSupabase, hasLoadedProjectsFromSupabase, recentProjects]);
 
   useEffect(() => {
-    if (!hasLoadedFromStorage) return;
     if (hasLoadedTeamFromSupabase) return;
+    if (!hasLoadedProjectsFromSupabase) return;
 
     const load = async () => {
       try {
@@ -1043,7 +1023,7 @@ export default function Home() {
     };
 
     void load();
-  }, [hasLoadedFromStorage, hasLoadedTeamFromSupabase, recentProjects]);
+  }, [hasLoadedTeamFromSupabase, hasLoadedProjectsFromSupabase, recentProjects]);
 
   const modalTitleId = useId();
   const inputClienteId = useId();
@@ -1237,7 +1217,12 @@ export default function Home() {
   }, [isModalOpen]);
 
   useEffect(() => {
-    setHasLoadedFromStorage(true);
+    try {
+      // Reset de cache: remove rastros antigos relacionados a obras.
+      window.localStorage.removeItem("sistema-arquiteta:recent-projects");
+      window.localStorage.removeItem("sistema-arquiteta:selected-project-id");
+    } catch {
+    }
   }, []);
 
   useEffect(() => {
@@ -1256,26 +1241,6 @@ export default function Home() {
 
   useEffect(() => {
     try {
-      const stored = window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
-      if (!stored) return;
-      setSelectedProjectId(stored);
-    } catch {
-    }
-  }, []);
-
-  useEffect(() => {
-    try {
-      if (!selectedProjectId) {
-        window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
-        return;
-      }
-      window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, selectedProjectId);
-    } catch {
-    }
-  }, [selectedProjectId]);
-
-  useEffect(() => {
-    try {
       const stored = window.localStorage.getItem(STORES_STORAGE_KEY);
       if (!stored) return;
       const parsed = JSON.parse(stored) as unknown;
@@ -1284,10 +1249,6 @@ export default function Home() {
     } catch {
     }
   }, []);
-
-  useEffect(() => {
-    if (!hasLoadedFromStorage) return;
-  }, [hasLoadedFromStorage]);
 
   useEffect(() => {
     try {
@@ -1416,10 +1377,6 @@ export default function Home() {
 
   function onClearAll() {
     setRecentProjects([]);
-    try {
-      window.localStorage.removeItem(STORAGE_KEY);
-    } catch {
-    }
   }
 
   function addAgendaEvent() {
