@@ -130,6 +130,17 @@ type EquipeObraRow = {
   contato?: string | null;
 };
 
+type PriceSearchResult = {
+  domain: string;
+  storeLabel: string;
+  logoUrl: string | null;
+  offers: {
+    priceCents: number;
+    productUrl: string;
+  }[];
+  searchUrl: string;
+};
+
 type AgendaEvent = {
   id: string;
   title: string;
@@ -138,6 +149,7 @@ type AgendaEvent = {
 
 const STORAGE_KEY = "sistema-arquiteta:recent-projects";
 const AGENDA_STORAGE_KEY = "sistema-arquiteta:agenda-events";
+const STORES_STORAGE_KEY = "sistema-arquiteta:store-domains";
 
 const SEED_PROJECTS: RecentProject[] = [];
 
@@ -147,6 +159,15 @@ function isAgendaEvent(value: unknown): value is AgendaEvent {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return typeof v.id === "string" && typeof v.title === "string" && typeof v.subtitle === "string";
+}
+
+function coerceStoreDomains(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((v) => typeof v === "string")
+    .map((v) => v.trim())
+    .filter((v) => v.length > 0)
+    .slice(0, 12);
 }
 
 function coerceRecentProject(value: unknown): RecentProject | null {
@@ -379,6 +400,16 @@ export default function Home() {
     mesesEstimados: "1",
     contato: "",
   });
+
+  const [storeDomains, setStoreDomains] = useState<string[]>([
+    "https://www.leroymerlin.com.br",
+    "https://www.telhanorte.com.br",
+    "https://www.cassol.com.br",
+  ]);
+  const [storeDomainInput, setStoreDomainInput] = useState<string>("");
+  const [priceSearchByMaterialId, setPriceSearchByMaterialId] = useState<
+    Record<string, { status: "idle" | "loading" | "error" | "success"; results: PriceSearchResult[]; error?: string }>
+  >({});
 
   const [hasLoadedFromStorage, setHasLoadedFromStorage] = useState(false);
   const [hasLoadedAgendaFromStorage, setHasLoadedAgendaFromStorage] = useState(false);
@@ -1017,12 +1048,30 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(STORES_STORAGE_KEY);
+      if (!stored) return;
+      const parsed = JSON.parse(stored) as unknown;
+      const domains = coerceStoreDomains(parsed);
+      if (domains.length > 0) setStoreDomains(domains);
+    } catch {
+    }
+  }, []);
+
+  useEffect(() => {
     if (!hasLoadedFromStorage) return;
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify(recentProjects));
     } catch {
     }
   }, [recentProjects, hasLoadedFromStorage]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORES_STORAGE_KEY, JSON.stringify(storeDomains));
+    } catch {
+    }
+  }, [storeDomains]);
 
   useEffect(() => {
     try {
@@ -1576,6 +1625,58 @@ export default function Home() {
     scheduleTeamSupabaseUpdate(id, patch);
   }
 
+  async function searchPricesForMaterial(materialId: string, query: string) {
+    if (!query.trim()) return;
+    const storesPayload = storeDomains.map((domain) => ({ domain }));
+
+    setPriceSearchByMaterialId((prev) => ({
+      ...prev,
+      [materialId]: { status: "loading", results: [] },
+    }));
+
+    try {
+      const res = await fetch("/api/price-search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query, stores: storesPayload }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+
+      const data = (await res.json()) as { results?: PriceSearchResult[] };
+      const results = Array.isArray(data.results) ? data.results : [];
+
+      const normalized = results
+        .map((r) => ({
+          ...r,
+          offers: Array.isArray(r.offers) ? r.offers : [],
+        }))
+        .sort((a, b) => {
+          const aBest = a.offers.length > 0 ? a.offers[0]?.priceCents ?? Number.POSITIVE_INFINITY : Number.POSITIVE_INFINITY;
+          const bBest = b.offers.length > 0 ? b.offers[0]?.priceCents ?? Number.POSITIVE_INFINITY : Number.POSITIVE_INFINITY;
+          return aBest - bBest;
+        });
+
+      setPriceSearchByMaterialId((prev) => ({
+        ...prev,
+        [materialId]: { status: "success", results: normalized },
+      }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao buscar preços";
+      setPriceSearchByMaterialId((prev) => ({
+        ...prev,
+        [materialId]: { status: "error", results: [], error: msg },
+      }));
+    }
+  }
+
+  function applyFoundPrice(materialId: string, priceCents: number) {
+    scheduleMaterialSupabaseUpdate(materialId, { valorCents: priceCents });
+  }
+
   function saveDiarioEntry() {
     if (!selectedProjectId) return;
     if (diarioForm.ocorrencias.trim().length === 0 && diarioForm.mudancas.trim().length === 0) {
@@ -1982,6 +2083,55 @@ export default function Home() {
                     </div>
                   </div>
 
+                  <div className="mt-6 rounded-2xl border border-zinc-200 bg-white p-4">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <div className="text-sm font-semibold tracking-tight text-zinc-900">Lojas para busca automática</div>
+                        <div className="mt-1 text-xs text-zinc-600">Cadastre apenas o domínio (ex: https://leroymerlin.com.br)</div>
+                      </div>
+                      <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:items-center">
+                        <input
+                          value={storeDomainInput}
+                          onChange={(e) => setStoreDomainInput(e.target.value)}
+                          className="h-11 w-full rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20 sm:w-96"
+                          placeholder="https://leroymerlin.com.br"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const cleaned = storeDomainInput.trim();
+                            if (!cleaned) return;
+                            setStoreDomains((prev) => {
+                              const exists = prev.some((d) => d.toLowerCase() === cleaned.toLowerCase());
+                              return exists ? prev : [cleaned, ...prev].slice(0, 12);
+                            });
+                            setStoreDomainInput("");
+                          }}
+                          className="h-11 rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                        >
+                          Adicionar loja
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {storeDomains.map((domain) => (
+                        <button
+                          key={domain}
+                          type="button"
+                          onClick={() => setStoreDomains((prev) => prev.filter((d) => d !== domain))}
+                          className="inline-flex items-center gap-2 rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50"
+                          aria-label={`Remover ${domain}`}
+                        >
+                          {domain}
+                          <span className="text-zinc-400">×</span>
+                        </button>
+                      ))}
+                      {storeDomains.length === 0 ? (
+                        <div className="text-sm text-zinc-600">Nenhuma loja cadastrada.</div>
+                      ) : null}
+                    </div>
+                  </div>
+
                   <form
                     className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-8"
                     onSubmit={(e) => {
@@ -2174,19 +2324,128 @@ export default function Home() {
                               </div>
                             </td>
                             <td className="px-5 py-4 text-right">
-                              <button
-                                type="button"
-                                onClick={() => deleteMaterial(m.id)}
-                                className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200 bg-white text-zinc-600 shadow-sm transition-colors hover:bg-zinc-50 hover:text-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
-                                aria-label="Excluir material"
-                              >
-                                <Trash2 className="h-4 w-4" aria-hidden="true" />
-                              </button>
+                              <div className="inline-flex items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => searchPricesForMaterial(m.id, m.item)}
+                                  className="inline-flex h-9 items-center justify-center rounded-full border border-zinc-200 bg-white px-3 text-xs font-semibold text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 hover:text-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                                >
+                                  Buscar Preço
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteMaterial(m.id)}
+                                  className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200 bg-white text-zinc-600 shadow-sm transition-colors hover:bg-zinc-50 hover:text-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                                  aria-label="Excluir material"
+                                >
+                                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
+                  </div>
+
+                  <div className="mt-6 space-y-3">
+                    {currentMaterials.map((m) => {
+                      const search = priceSearchByMaterialId[m.id];
+                      if (!search || (search.status === "idle" && search.results.length === 0)) return null;
+
+                      const bestOffer = search.results
+                        .flatMap((r) => r.offers.map((o) => ({ domain: r.domain, priceCents: o.priceCents })))
+                        .reduce<{ domain: string; priceCents: number } | null>((best, cur) => {
+                          if (!best) return cur;
+                          return cur.priceCents < best.priceCents ? cur : best;
+                        }, null);
+
+                      return (
+                        <div key={`${m.id}-price`} className="rounded-2xl border border-zinc-200 bg-white p-4">
+                          <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="text-sm font-semibold text-zinc-900">Preços encontrados: {m.item}</div>
+                            <div className="text-xs font-medium text-zinc-600">
+                              {search.status === "loading"
+                                ? "Buscando..."
+                                : search.status === "error"
+                                  ? "Falha"
+                                  : `${search.results.length} resultado(s)`}
+                            </div>
+                          </div>
+                          {search.status === "error" ? (
+                            <div className="mt-2 text-sm text-red-700">{search.error ?? "Falha ao buscar preços."}</div>
+                          ) : null}
+                          <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-2">
+                            {search.results.map((r) => {
+                              const hasOffers = r.offers.length > 0;
+                              const bestInStore = hasOffers ? r.offers[0].priceCents : null;
+                              const isGlobalBest =
+                                typeof bestInStore === "number" &&
+                                bestOffer != null &&
+                                bestOffer.domain === r.domain &&
+                                bestOffer.priceCents === bestInStore;
+
+                              return (
+                                <div key={`${m.id}-${r.domain}`} className="rounded-2xl border border-zinc-200 bg-white px-4 py-3">
+                                  <div className="flex flex-wrap items-start justify-between gap-3">
+                                    <div className="flex items-center gap-3">
+                                      {r.logoUrl ? (
+                                        // eslint-disable-next-line @next/next/no-img-element
+                                        <img src={r.logoUrl} alt={r.storeLabel} className="h-6 w-6 rounded" />
+                                      ) : (
+                                        <div className="h-6 w-6 rounded bg-zinc-100" aria-hidden="true" />
+                                      )}
+                                      <div>
+                                        <div className="flex items-center gap-2">
+                                          <div className="text-sm font-semibold text-zinc-900">{r.storeLabel}</div>
+                                          {isGlobalBest ? (
+                                            <span className="rounded-full bg-[#D4AF37]/15 px-2 py-0.5 text-[11px] font-semibold text-zinc-900">Menor preço</span>
+                                          ) : null}
+                                        </div>
+                                        <a
+                                          href={r.searchUrl}
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          className="mt-0.5 block text-xs font-medium text-zinc-600 underline decoration-zinc-300 underline-offset-4 hover:text-zinc-900"
+                                        >
+                                          Abrir busca
+                                        </a>
+                                      </div>
+                                    </div>
+                                    <div className="text-xs font-medium text-zinc-600">{hasOffers ? `${r.offers.length} oferta(s)` : "Nenhuma oferta"}</div>
+                                  </div>
+
+                                  <div className="mt-3 grid grid-cols-1 gap-2">
+                                    {(r.offers.length > 0 ? r.offers : []).slice(0, 3).map((o) => (
+                                      <div
+                                        key={`${m.id}-${r.domain}-${o.priceCents}`}
+                                        className={
+                                          bestOffer != null && bestOffer.domain === r.domain && bestOffer.priceCents === o.priceCents
+                                            ? "flex items-center justify-between gap-3 rounded-xl border border-[#D4AF37]/40 bg-[#D4AF37]/5 px-3 py-2"
+                                            : "flex items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white px-3 py-2"
+                                        }
+                                      >
+                                        <div className="text-sm font-semibold text-zinc-900">{formatCentsToBRL(o.priceCents)}</div>
+                                        <button
+                                          type="button"
+                                          onClick={() => applyFoundPrice(m.id, o.priceCents)}
+                                          className="h-9 rounded-full bg-[#D4AF37] px-4 text-xs font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                                        >
+                                          Usar este Preço
+                                        </button>
+                                      </div>
+                                    ))}
+                                    {r.offers.length === 0 ? (
+                                      <div className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-600">Preço não encontrado automaticamente.</div>
+                                    ) : null}
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               ) : activeTab === "equipe" ? (
