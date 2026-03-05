@@ -465,6 +465,9 @@ export default function Home() {
   const [levantamentoSaveMessage, setLevantamentoSaveMessage] = useState<string | null>(null);
   const [projectNotice, setProjectNotice] = useState<{ kind: "success" | "error"; message: string } | null>(null);
 
+  const [debugHud, setDebugHud] = useState<string>("");
+  const DEBUG_TOUCH = true;
+
   const materialUpdateTimersRef = useRef<Record<string, number>>({});
   const teamUpdateTimersRef = useRef<Record<string, number>>({});
 
@@ -475,9 +478,13 @@ export default function Home() {
 
   function debugMobileTap(label: string) {
     // TEMP: debug mobile touch/click
-    // eslint-disable-next-line no-console
     console.log("Botão clicado!", label);
-    alert(`Clique disparado: ${label}`);
+    setDebugHud(`${new Date().toLocaleTimeString()} · ACTION · ${label}`);
+    try {
+      alert(`Clique disparado: ${label}`);
+    } catch {
+      // ignore
+    }
   }
 
   function submitFormFromTouch(form: HTMLFormElement | null, label: string) {
@@ -485,6 +492,42 @@ export default function Home() {
     if (!form) return;
     form.requestSubmit();
   }
+
+  useEffect(() => {
+    if (!DEBUG_TOUCH) return;
+
+    const handler = (ev: Event) => {
+      const e = ev as unknown as PointerEvent;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName ?? "?";
+      const id = target?.id ? `#${target.id}` : "";
+      const cls = target?.className ? String(target.className).slice(0, 80) : "";
+      const x = typeof e.clientX === "number" ? e.clientX : 0;
+      const y = typeof e.clientY === "number" ? e.clientY : 0;
+      const top = typeof document !== "undefined" ? (document.elementFromPoint(x, y) as HTMLElement | null) : null;
+      const topTag = top?.tagName ?? "?";
+      const topId = top?.id ? `#${top.id}` : "";
+      const topCls = top?.className ? String(top.className).slice(0, 80) : "";
+
+      setDebugHud(
+        `${new Date().toLocaleTimeString()} · ${ev.type} · target=${tag}${id} · top=${topTag}${topId}\n` +
+          `target.cls=${cls}\n` +
+          `top.cls=${topCls}`,
+      );
+    };
+
+    document.addEventListener("pointerdown", handler, { capture: true });
+    document.addEventListener("pointerup", handler, { capture: true });
+    document.addEventListener("click", handler, { capture: true });
+    document.addEventListener("touchend", handler, { capture: true });
+
+    return () => {
+      document.removeEventListener("pointerdown", handler, { capture: true } as AddEventListenerOptions);
+      document.removeEventListener("pointerup", handler, { capture: true } as AddEventListenerOptions);
+      document.removeEventListener("click", handler, { capture: true } as AddEventListenerOptions);
+      document.removeEventListener("touchend", handler, { capture: true } as AddEventListenerOptions);
+    };
+  }, [DEBUG_TOUCH]);
 
   async function insertMaterialToSupabase(obraId: string, material: MaterialItem) {
     const supabase = getSupabase();
@@ -1954,6 +1997,14 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-[#FFFFFF] text-zinc-800">
+      {DEBUG_TOUCH ? (
+        <div
+          className="pointer-events-none max-w-[92vw] whitespace-pre-wrap rounded-xl border border-zinc-900 bg-white px-3 py-2 text-[11px] leading-4 text-zinc-900 shadow-sm"
+          style={{ position: "fixed", top: 8, left: 8, zIndex: 2147483647 }}
+        >
+          {debugHud || "DEBUG_TOUCH: toque/click em qualquer área para ver o elemento que está recebendo o evento."}
+        </div>
+      ) : null}
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10">
         {selectedProject && selectedProjectId ? (
           <div className="flex flex-col gap-6">
@@ -3302,7 +3353,14 @@ export default function Home() {
                 </div>
                 <div className="flex flex-col items-end gap-3 sm:flex-row sm:items-center">
                   <button
+                    id="btn-novo-projeto"
                     type="button"
+                    onPointerUp={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      debugMobileTap("Dashboard: Novo Projeto (pointerup)");
+                      openModal();
+                    }}
                     onTouchEnd={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
@@ -3313,7 +3371,8 @@ export default function Home() {
                       debugMobileTap("Dashboard: Novo Projeto (click)");
                       openModal();
                     }}
-                    className="pointer-events-auto relative z-[999] inline-flex min-h-12 items-center justify-center rounded-xl bg-[#D4AF37] px-6 py-3 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                    className="pointer-events-auto relative inline-flex min-h-12 items-center justify-center rounded-xl bg-[#D4AF37] px-6 py-3 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                    style={{ zIndex: 2147483000, position: "relative" }}
                   >
                     Novo Projeto
                   </button>
