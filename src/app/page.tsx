@@ -422,7 +422,7 @@ export default function Home() {
     nome: "",
     funcao: "",
     valor: "",
-    mesesEstimados: "1",
+    mesesEstimados: "",
     prazo: "",
     contato: "",
   });
@@ -1767,15 +1767,16 @@ export default function Home() {
     const mesesEstimados = Number.isFinite(meses) && meses > 0 ? meses : 1;
     const prazo = String(teamForm.prazo ?? "").trim();
 
-    if (teamForm.nome.trim().length === 0 || teamForm.funcao.trim().length === 0 || valorCents <= 0) {
-      return;
-    }
+    const nome = teamForm.nome.trim();
+    if (nome.length === 0) return;
+    const funcao = teamForm.funcao.trim() || "(não informado)";
+    const safeValorCents = Number.isFinite(valorCents) && valorCents > 0 ? valorCents : 0;
 
     const member: TeamMember = {
       id: String(Date.now()),
-      nome: teamForm.nome.trim(),
-      funcao: teamForm.funcao.trim(),
-      valorCents,
+      nome,
+      funcao,
+      valorCents: safeValorCents,
       contato: teamForm.contato.trim() || undefined,
       mesesEstimados,
       faltas: 0,
@@ -1787,11 +1788,20 @@ export default function Home() {
       const current = prev[selectedProjectId] ?? [];
       return { ...prev, [selectedProjectId]: [member, ...current] };
     });
-    setTeamForm({ nome: "", funcao: "", valor: "", mesesEstimados: "1", prazo: "", contato: "" });
+    setTeamForm({ nome: "", funcao: "", valor: "", mesesEstimados: "", prazo: "", contato: "" });
 
     void (async () => {
       setIsSavingTeamMember(true);
       try {
+        console.log("Equipe: payload local", {
+          obraId: selectedProjectId,
+          nome: member.nome,
+          funcao: member.funcao,
+          valorCents: member.valorCents,
+          mesesEstimados: member.mesesEstimados,
+          prazo: member.prazo,
+          contato: member.contato,
+        });
         const insertedId = await insertTeamMemberToSupabase(selectedProjectId, member);
         setTeamByProject((prev) => {
           const current = prev[selectedProjectId] ?? [];
@@ -1807,6 +1817,7 @@ export default function Home() {
         setProjectNotice({ kind: "success", message: "Sincronizado: equipe salva no Supabase." });
       } catch (err) {
         const msg = err instanceof Error ? err.message : "Falha ao salvar equipe no Supabase";
+        alert("ERRO NO BANCO: " + msg);
         setTeamByProject((prev) => {
           const current = prev[selectedProjectId] ?? [];
           return { ...prev, [selectedProjectId]: current.map((t) => (t.id === member.id ? { ...t, syncStatus: "error" } : t)) };
