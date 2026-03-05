@@ -387,6 +387,7 @@ function AgendaButton({
 
 export default function Home() {
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [isSavingProject, setIsSavingProject] = useState(false);
   const [form, setForm] = useState<NewProjectFormState>({
     cliente: "",
     whatsappCliente: "",
@@ -465,9 +466,6 @@ export default function Home() {
   const [levantamentoSaveMessage, setLevantamentoSaveMessage] = useState<string | null>(null);
   const [projectNotice, setProjectNotice] = useState<{ kind: "success" | "error"; message: string } | null>(null);
 
-  const [debugHud, setDebugHud] = useState<string>("");
-  const DEBUG_TOUCH = true;
-
   const materialUpdateTimersRef = useRef<Record<string, number>>({});
   const teamUpdateTimersRef = useRef<Record<string, number>>({});
 
@@ -477,57 +475,14 @@ export default function Home() {
   const diarioFormRef = useRef<HTMLFormElement | null>(null);
 
   function debugMobileTap(label: string) {
-    // TEMP: debug mobile touch/click
     console.log("Botão clicado!", label);
-    setDebugHud(`${new Date().toLocaleTimeString()} · ACTION · ${label}`);
-    try {
-      alert(`Clique disparado: ${label}`);
-    } catch {
-      // ignore
-    }
   }
 
-  function submitFormFromTouch(form: HTMLFormElement | null, label: string) {
-    debugMobileTap(label);
+  function submitFormFromTouch(form: HTMLFormElement | null, label?: string) {
+    if (label) debugMobileTap(label);
     if (!form) return;
     form.requestSubmit();
   }
-
-  useEffect(() => {
-    if (!DEBUG_TOUCH) return;
-
-    const handler = (ev: Event) => {
-      const e = ev as unknown as PointerEvent;
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName ?? "?";
-      const id = target?.id ? `#${target.id}` : "";
-      const cls = target?.className ? String(target.className).slice(0, 80) : "";
-      const x = typeof e.clientX === "number" ? e.clientX : 0;
-      const y = typeof e.clientY === "number" ? e.clientY : 0;
-      const top = typeof document !== "undefined" ? (document.elementFromPoint(x, y) as HTMLElement | null) : null;
-      const topTag = top?.tagName ?? "?";
-      const topId = top?.id ? `#${top.id}` : "";
-      const topCls = top?.className ? String(top.className).slice(0, 80) : "";
-
-      setDebugHud(
-        `${new Date().toLocaleTimeString()} · ${ev.type} · target=${tag}${id} · top=${topTag}${topId}\n` +
-          `target.cls=${cls}\n` +
-          `top.cls=${topCls}`,
-      );
-    };
-
-    document.addEventListener("pointerdown", handler, { capture: true });
-    document.addEventListener("pointerup", handler, { capture: true });
-    document.addEventListener("click", handler, { capture: true });
-    document.addEventListener("touchend", handler, { capture: true });
-
-    return () => {
-      document.removeEventListener("pointerdown", handler, { capture: true } as AddEventListenerOptions);
-      document.removeEventListener("pointerup", handler, { capture: true } as AddEventListenerOptions);
-      document.removeEventListener("click", handler, { capture: true } as AddEventListenerOptions);
-      document.removeEventListener("touchend", handler, { capture: true } as AddEventListenerOptions);
-    };
-  }, [DEBUG_TOUCH]);
 
   async function insertMaterialToSupabase(obraId: string, material: MaterialItem) {
     const supabase = getSupabase();
@@ -614,14 +569,55 @@ export default function Home() {
   async function insertProjectToSupabase(payload: { nome_obra: string; cliente: string; localizacao: string; status: string }) {
     const supabase = getSupabase();
     const { data, error } = await supabase.from("projetos_obra").insert(payload).select("id").single();
-    if (error) throw new Error(error.message);
-    return (data as { id: string | number } | null)?.id ?? null;
+    return {
+      id: (data as { id: string | number } | null)?.id ?? null,
+      error,
+    };
   }
 
   async function deleteProjectFromSupabase(id: string) {
     const supabase = getSupabase();
     const { error } = await supabase.from("projetos_obra").delete().eq("id", id);
     if (error) throw new Error(error.message);
+  }
+
+  function onDeleteProject(id: string) {
+    setRecentProjects((prev) => prev.filter((p) => p.id !== id));
+
+    setDiarioByProject((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    setMaterialsByProject((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    setTeamByProject((prev) => {
+      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+
+    if (selectedProjectId === id) {
+      setSelectedProjectId(null);
+      setActiveTab("diario");
+    }
+
+    void (async () => {
+      try {
+        await deleteProjectFromSupabase(id);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao excluir obra";
+        setProjectNotice({ kind: "error", message: `Falha ao excluir obra no Supabase: ${msg}` });
+      }
+    })();
   }
 
   async function updateMaterialFieldsInSupabase(material: MaterialItem, patch: { quantidade?: number; preco_unitario?: number }) {
@@ -1061,36 +1057,8 @@ export default function Home() {
   const inputValorId = useId();
 
   const canSave = useMemo(() => {
-    const whatsappDigits = normalizeWhatsAppNumber(form.whatsappCliente);
-    const areaM2 = parseAreaM2(form.areaM2);
-    const cubM2Cents = parseBRLToCents(form.cubM2);
-    const valorPrevistoManualCents = parseBRLToCents(form.valorPrevisto);
-    const valorPrevistoCents =
-      valorPrevistoManualCents > 0 && Number.isFinite(valorPrevistoManualCents)
-        ? valorPrevistoManualCents
-        : Math.round(areaM2 * cubM2Cents);
-    return (
-      form.cliente.trim().length > 0 &&
-      form.projeto.trim().length > 0 &&
-      form.enderecoObra.trim().length > 0 &&
-      form.uf.trim().length > 0 &&
-      form.padraoCUB.trim().length > 0 &&
-      areaM2 > 0 &&
-      cubM2Cents > 0 &&
-      valorPrevistoCents > 0 &&
-      whatsappDigits.length >= 10
-    );
-  }, [
-    form.cliente,
-    form.projeto,
-    form.enderecoObra,
-    form.uf,
-    form.padraoCUB,
-    form.areaM2,
-    form.cubM2,
-    form.valorPrevisto,
-    form.whatsappCliente,
-  ]);
+    return form.cliente.trim().length > 0 && form.projeto.trim().length > 0;
+  }, [form.cliente, form.projeto]);
 
   const totalProfitCents = useMemo(() => {
     return recentProjects.reduce((acc, p) => acc + p.valorPrevistoCents, 0);
@@ -1367,6 +1335,7 @@ export default function Home() {
   }
 
   function onSave() {
+    if (isSavingProject) return;
     const whatsappDigits = normalizeWhatsAppNumber(form.whatsappCliente);
     const areaM2 = parseAreaM2(form.areaM2);
     const cubM2Cents = parseBRLToCents(form.cubM2);
@@ -1377,16 +1346,35 @@ export default function Home() {
         : Math.round(areaM2 * cubM2Cents);
 
     void (async () => {
+      setIsSavingProject(true);
       try {
         const nomeObra = form.projeto.trim();
         const cliente = form.cliente.trim();
-        const localizacao = form.enderecoObra.trim();
-        const insertedId = await insertProjectToSupabase({
+        const localizacao = form.enderecoObra.trim() || "(não informado)";
+
+        const payload = {
           nome_obra: nomeObra,
           cliente,
           localizacao,
           status: "ativa",
+        };
+
+        console.log("Novo Projeto: payload insert", payload);
+        console.log("Novo Projeto: valores capturados", {
+          cliente: form.cliente,
+          uf: form.uf,
+          padraoCUB: form.padraoCUB,
+          areaM2: form.areaM2,
+          cubM2: form.cubM2,
+          whatsappCliente: form.whatsappCliente,
+          parsed: { whatsappDigits, areaM2, cubM2Cents, valorPrevistoCents },
         });
+
+        const { id: insertedId, error } = await insertProjectToSupabase(payload);
+        if (error) {
+          alert("ERRO NO BANCO: " + error.message);
+          throw new Error(error.message);
+        }
         if (!insertedId) throw new Error("Supabase não retornou ID da obra.");
 
         const newProject: RecentProject = {
@@ -1405,6 +1393,7 @@ export default function Home() {
         setRecentProjects((prev) => [newProject, ...prev]);
         setProjectNotice({ kind: "success", message: "Obra criada e sincronizada no banco de dados." });
         closeModal();
+
         setForm({
           cliente: "",
           whatsappCliente: "",
@@ -1417,47 +1406,12 @@ export default function Home() {
           valorPrevisto: "",
         });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : "Falha ao criar obra";
-        setProjectNotice({ kind: "error", message: `Falha ao criar obra no Supabase: ${msg}` });
+        const msg = err instanceof Error ? err.message : "Falha ao cadastrar obra";
+        setProjectNotice({ kind: "error", message: `Falha ao cadastrar obra: ${msg}` });
+      } finally {
+        setIsSavingProject(false);
       }
     })();
-  }
-
-  function onDeleteProject(id: string) {
-    setRecentProjects((prev) => prev.filter((p) => p.id !== id));
-
-    void (async () => {
-      try {
-        await deleteProjectFromSupabase(id);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Falha ao excluir obra";
-        setProjectNotice({ kind: "error", message: `Falha ao excluir obra no Supabase: ${msg}` });
-      }
-    })();
-
-    setDiarioByProject((prev) => {
-      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-    setMaterialsByProject((prev) => {
-      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-    setTeamByProject((prev) => {
-      if (!Object.prototype.hasOwnProperty.call(prev, id)) return prev;
-      const next = { ...prev };
-      delete next[id];
-      return next;
-    });
-
-    if (selectedProjectId === id) {
-      setSelectedProjectId(null);
-      setActiveTab("diario");
-    }
   }
 
   function onClearAll() {
@@ -1997,14 +1951,6 @@ export default function Home() {
 
   return (
     <div className="min-h-screen bg-[#FFFFFF] text-zinc-800">
-      {DEBUG_TOUCH ? (
-        <div
-          className="pointer-events-none max-w-[92vw] whitespace-pre-wrap rounded-xl border border-zinc-900 bg-white px-3 py-2 text-[11px] leading-4 text-zinc-900 shadow-sm"
-          style={{ position: "fixed", top: 8, left: 8, zIndex: 2147483647 }}
-        >
-          {debugHud || "DEBUG_TOUCH: toque/click em qualquer área para ver o elemento que está recebendo o evento."}
-        </div>
-      ) : null}
       <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-6 py-10">
         {selectedProject && selectedProjectId ? (
           <div className="flex flex-col gap-6">
@@ -3355,20 +3301,12 @@ export default function Home() {
                   <button
                     id="btn-novo-projeto"
                     type="button"
-                    onPointerUp={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      debugMobileTap("Dashboard: Novo Projeto (pointerup)");
-                      openModal();
-                    }}
                     onTouchEnd={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
-                      debugMobileTap("Dashboard: Novo Projeto");
                       openModal();
                     }}
                     onClick={() => {
-                      debugMobileTap("Dashboard: Novo Projeto (click)");
                       openModal();
                     }}
                     className="pointer-events-auto relative inline-flex min-h-12 items-center justify-center rounded-xl bg-[#D4AF37] px-6 py-3 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
@@ -3616,7 +3554,7 @@ export default function Home() {
                     ref={newProjectFormRef}
                     onSubmit={(e) => {
                       e.preventDefault();
-                      if (!canSave) return;
+                      if (isSavingProject) return;
                       onSave();
                     }}
                   >
@@ -3763,10 +3701,10 @@ export default function Home() {
                       </button>
                       <button
                         type="submit"
-                        disabled={!canSave}
+                        disabled={!canSave || isSavingProject}
                         className="rounded-full bg-[#D4AF37] px-6 py-2.5 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] disabled:cursor-not-allowed disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
                       >
-                        Salvar
+                        {isSavingProject ? "Salvando..." : "Salvar"}
                       </button>
                     </div>
                   </form>
