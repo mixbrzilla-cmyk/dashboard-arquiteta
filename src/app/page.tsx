@@ -1,20 +1,24 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useEffect, useId, useMemo, useState } from "react";
-
+import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   Building2,
   CalendarDays,
+  CloudAlert,
+  CloudCheck,
+  CloudUpload,
   Download,
+  FileText,
   MessageCircle,
   Phone,
   Sparkles,
   Trash2,
   TrendingUp,
-  FileText,
 } from "lucide-react";
+
+import { getSupabase } from "./supabaseClient";
 
 type StatCardProps = {
   title: string;
@@ -77,22 +81,51 @@ type DiarioEntry = {
 
 type MaterialStatus = "cotado" | "comprado" | "entregue";
 
+type SyncStatus = "pending" | "synced" | "error";
+
+type MateriaisObraRow = {
+  id: string | number;
+  nome_obra: string;
+  nome_material?: string | null;
+  fornecedor?: string | null;
+  preco_unitario?: number | null;
+  quantidade?: number | null;
+  status?: MaterialStatus | null;
+};
+
 type MaterialItem = {
   id: string;
+  supabaseId?: string;
   item: string;
   fornecedor: string;
   valorCents: number;
   status: MaterialStatus;
   contato?: string;
+  quantidade?: number;
+  syncStatus?: SyncStatus;
 };
 
 type TeamMember = {
   id: string;
+  supabaseId?: string;
   nome: string;
   funcao: string;
-  valorCents: number;
+  valorCents: number; // diária
+  mesesEstimados?: number;
+  faltas?: number;
   contato?: string;
-  faltouHoje?: boolean;
+  syncStatus?: SyncStatus;
+};
+
+type EquipeObraRow = {
+  id: string | number;
+  nome_obra: string;
+  nome_profissional?: string | null;
+  funcao?: string | null;
+  valor_diaria?: number | null;
+  meses_estimados?: number | null;
+  faltas?: number | null;
+  contato?: string | null;
 };
 
 type AgendaEvent = {
@@ -339,11 +372,15 @@ export default function Home() {
     nome: "",
     funcao: "",
     valor: "",
+    mesesEstimados: "1",
     contato: "",
   });
 
   const [hasLoadedFromStorage, setHasLoadedFromStorage] = useState(false);
   const [hasLoadedAgendaFromStorage, setHasLoadedAgendaFromStorage] = useState(false);
+
+  const [hasLoadedMaterialsFromSupabase, setHasLoadedMaterialsFromSupabase] = useState(false);
+  const [hasLoadedTeamFromSupabase, setHasLoadedTeamFromSupabase] = useState(false);
 
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>(SEED_PROJECTS);
   const [agendaEvents, setAgendaEvents] = useState<AgendaEvent[]>(SEED_AGENDA_EVENTS);
@@ -358,6 +395,400 @@ export default function Home() {
   const [levantamentoError, setLevantamentoError] = useState<string | null>(null);
   const [levantamentoTextSample, setLevantamentoTextSample] = useState<string>("");
   const [levantamentoItems, setLevantamentoItems] = useState<LevantamentoItem[]>([]);
+  const [levantamentoSaveStatus, setLevantamentoSaveStatus] = useState<"idle" | "saving" | "success" | "error">("idle");
+  const [levantamentoSaveMessage, setLevantamentoSaveMessage] = useState<string | null>(null);
+  const [projectNotice, setProjectNotice] = useState<{ kind: "success" | "error"; message: string } | null>(null);
+
+  const materialUpdateTimersRef = useRef<Record<string, number>>({});
+  const teamUpdateTimersRef = useRef<Record<string, number>>({});
+
+  async function insertMaterialToSupabase(obraId: string, material: MaterialItem) {
+    const supabase = getSupabase();
+
+    const project = recentProjects.find((p) => p.id === obraId) ?? null;
+    const nomeObra = project?.projeto?.trim() ?? "";
+    if (!nomeObra) throw new Error("Nome da obra ausente para sincronização (campo 'projeto').");
+
+    const payload = {
+      nome_obra: nomeObra,
+      nome_material: material.item,
+      fornecedor: material.fornecedor,
+      preco_unitario: material.valorCents / 100,
+      quantidade: typeof material.quantidade === "number" && Number.isFinite(material.quantidade) ? material.quantidade : 1,
+      status: material.status,
+    };
+
+    const { data, error } = await supabase.from("materiais_obra").insert(payload).select("id").single();
+    if (error) throw new Error(error.message);
+    return (data as { id: string | number } | null)?.id ?? null;
+  }
+
+  async function updateMaterialFieldsInSupabase(material: MaterialItem, patch: { quantidade?: number; preco_unitario?: number }) {
+    const supabase = getSupabase();
+
+    if (!material.supabaseId) {
+      throw new Error("Material ainda não possui ID do Supabase.");
+    }
+
+    const updatePayload: { quantidade?: number; preco_unitario?: number } = {};
+    if (typeof patch.quantidade === "number" && Number.isFinite(patch.quantidade)) updatePayload.quantidade = patch.quantidade;
+    if (typeof patch.preco_unitario === "number" && Number.isFinite(patch.preco_unitario)) updatePayload.preco_unitario = patch.preco_unitario;
+
+    const { error } = await supabase.from("materiais_obra").update(updatePayload).eq("id", material.supabaseId);
+    if (error) throw new Error(error.message);
+  }
+
+  function scheduleMaterialSupabaseUpdate(materialId: string, patch: { quantidade?: number; valorCents?: number }) {
+    if (!selectedProjectId) return;
+
+    const target = (materialsByProject[selectedProjectId] ?? []).find((m) => m.id === materialId) ?? null;
+    if (!target) return;
+
+    setMaterialsByProject((prev) => {
+      const current = prev[selectedProjectId] ?? [];
+      return {
+        ...prev,
+        [selectedProjectId]: current.map((m) =>
+          m.id === materialId
+            ? {
+                ...m,
+                ...("quantidade" in patch ? { quantidade: patch.quantidade } : null),
+                ...("valorCents" in patch ? { valorCents: patch.valorCents ?? m.valorCents } : null),
+                syncStatus: m.supabaseId ? "pending" : m.syncStatus,
+              }
+            : m,
+        ),
+      };
+    });
+
+    if (!target.supabaseId) return;
+
+    const existing = materialUpdateTimersRef.current[materialId];
+    if (existing) window.clearTimeout(existing);
+
+    materialUpdateTimersRef.current[materialId] = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const nextQuantity = typeof patch.quantidade === "number" ? patch.quantidade : target.quantidade ?? 1;
+          const nextUnit = typeof patch.valorCents === "number" ? patch.valorCents / 100 : target.valorCents / 100;
+
+          await updateMaterialFieldsInSupabase(target, {
+            quantidade: nextQuantity,
+            preco_unitario: nextUnit,
+          });
+
+          setMaterialsByProject((prev) => {
+            const current = prev[selectedProjectId] ?? [];
+            return {
+              ...prev,
+              [selectedProjectId]: current.map((m) => (m.id === materialId ? { ...m, syncStatus: "synced" } : m)),
+            };
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Falha ao atualizar material no Supabase";
+          setMaterialsByProject((prev) => {
+            const current = prev[selectedProjectId] ?? [];
+            return {
+              ...prev,
+              [selectedProjectId]: current.map((m) => (m.id === materialId ? { ...m, syncStatus: "error" } : m)),
+            };
+          });
+          setProjectNotice({ kind: "error", message: `Falha ao sincronizar material: ${msg}` });
+        }
+      })();
+    }, 450);
+  }
+
+  async function insertTeamMemberToSupabase(obraId: string, member: TeamMember) {
+    const supabase = getSupabase();
+    const project = recentProjects.find((p) => p.id === obraId) ?? null;
+    const nomeObra = project?.projeto?.trim() ?? "";
+    if (!nomeObra) throw new Error("Nome da obra ausente para sincronização (campo 'projeto').");
+
+    const payload = {
+      nome_obra: nomeObra,
+      nome_profissional: member.nome,
+      funcao: member.funcao,
+      valor_diaria: member.valorCents / 100,
+      meses_estimados: typeof member.mesesEstimados === "number" && Number.isFinite(member.mesesEstimados) ? member.mesesEstimados : 1,
+      faltas: typeof member.faltas === "number" && Number.isFinite(member.faltas) ? member.faltas : 0,
+      contato: member.contato ?? null,
+    };
+
+    const { data, error } = await supabase.from("equipe_obra").insert(payload).select("id").single();
+    if (error) throw new Error(error.message);
+    return (data as { id: string | number } | null)?.id ?? null;
+  }
+
+  async function updateTeamMemberInSupabase(member: TeamMember, patch: Partial<{ valor_diaria: number; meses_estimados: number; faltas: number }>) {
+    const supabase = getSupabase();
+    if (!member.supabaseId) throw new Error("Membro ainda não possui ID do Supabase.");
+    const { error } = await supabase.from("equipe_obra").update(patch).eq("id", member.supabaseId);
+    if (error) throw new Error(error.message);
+  }
+
+  function scheduleTeamSupabaseUpdate(memberId: string, patch: Partial<{ valorCents: number; mesesEstimados: number; faltas: number }>) {
+    if (!selectedProjectId) return;
+    const target = (teamByProject[selectedProjectId] ?? []).find((t) => t.id === memberId) ?? null;
+    if (!target) return;
+
+    setTeamByProject((prev) => {
+      const current = prev[selectedProjectId] ?? [];
+      return {
+        ...prev,
+        [selectedProjectId]: current.map((t) =>
+          t.id === memberId
+            ? {
+                ...t,
+                ...("valorCents" in patch ? { valorCents: patch.valorCents ?? t.valorCents } : null),
+                ...("mesesEstimados" in patch ? { mesesEstimados: patch.mesesEstimados } : null),
+                ...("faltas" in patch ? { faltas: patch.faltas } : null),
+                syncStatus: t.supabaseId ? "pending" : t.syncStatus,
+              }
+            : t,
+        ),
+      };
+    });
+
+    if (!target.supabaseId) return;
+
+    const existing = teamUpdateTimersRef.current[memberId];
+    if (existing) window.clearTimeout(existing);
+
+    teamUpdateTimersRef.current[memberId] = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const nextDiaria = typeof patch.valorCents === "number" ? patch.valorCents / 100 : target.valorCents / 100;
+          const nextMeses = typeof patch.mesesEstimados === "number" ? patch.mesesEstimados : target.mesesEstimados ?? 1;
+          const nextFaltas = typeof patch.faltas === "number" ? patch.faltas : target.faltas ?? 0;
+
+          await updateTeamMemberInSupabase(target, {
+            valor_diaria: nextDiaria,
+            meses_estimados: nextMeses,
+            faltas: nextFaltas,
+          });
+
+          setTeamByProject((prev) => {
+            const current = prev[selectedProjectId] ?? [];
+            return {
+              ...prev,
+              [selectedProjectId]: current.map((t) => (t.id === memberId ? { ...t, syncStatus: "synced" } : t)),
+            };
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Falha ao atualizar equipe no Supabase";
+          setTeamByProject((prev) => {
+            const current = prev[selectedProjectId] ?? [];
+            return {
+              ...prev,
+              [selectedProjectId]: current.map((t) => (t.id === memberId ? { ...t, syncStatus: "error" } : t)),
+            };
+          });
+          setProjectNotice({ kind: "error", message: `Falha ao sincronizar equipe: ${msg}` });
+        }
+      })();
+    }, 450);
+  }
+
+  async function updateMaterialStatusInSupabase(obraId: string, material: MaterialItem, nextStatus: MaterialStatus) {
+    const supabase = getSupabase();
+
+    if (!material.supabaseId) {
+      throw new Error("Material ainda não possui ID do Supabase.");
+    }
+
+    const { error } = await supabase
+      .from("materiais_obra")
+      .update({ status: nextStatus })
+      .eq("id", material.supabaseId);
+
+    if (error) throw new Error(error.message);
+  }
+
+  function updateMaterialStatus(materialId: string, nextStatus: MaterialStatus) {
+    if (!selectedProjectId) return;
+
+    const target = (materialsByProject[selectedProjectId] ?? []).find((m) => m.id === materialId) ?? null;
+    if (!target) return;
+
+    setMaterialsByProject((prev) => {
+      const current = prev[selectedProjectId] ?? [];
+      return {
+        ...prev,
+        [selectedProjectId]: current.map((m) =>
+          m.id === materialId ? { ...m, status: nextStatus, syncStatus: m.supabaseId ? "pending" : m.syncStatus } : m,
+        ),
+      };
+    });
+
+    if (!target.supabaseId) return;
+
+    void (async () => {
+      try {
+        await updateMaterialStatusInSupabase(selectedProjectId, target, nextStatus);
+        setMaterialsByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return {
+            ...prev,
+            [selectedProjectId]: current.map((m) => (m.id === materialId ? { ...m, syncStatus: "synced" } : m)),
+          };
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao atualizar status no Supabase";
+        setMaterialsByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return {
+            ...prev,
+            [selectedProjectId]: current.map((m) => (m.id === materialId ? { ...m, syncStatus: "error" } : m)),
+          };
+        });
+        setProjectNotice({ kind: "error", message: `Falha ao sincronizar status: ${msg}` });
+      }
+    })();
+  }
+
+  useEffect(() => {
+    if (!hasLoadedFromStorage) return;
+    if (hasLoadedMaterialsFromSupabase) return;
+
+    const load = async () => {
+      try {
+        const obraNameByProjectId = recentProjects.reduce<Record<string, string>>((acc, p) => {
+          if (p.id && p.projeto?.trim()) acc[p.id] = p.projeto.trim();
+          return acc;
+        }, {});
+
+        const projectIdByObraName = Object.entries(obraNameByProjectId).reduce<Record<string, string>>((acc, [projectId, obraName]) => {
+          acc[obraName] = projectId;
+          return acc;
+        }, {});
+
+        const obraNames = Object.values(obraNameByProjectId);
+
+        if (obraNames.length === 0) {
+          setHasLoadedMaterialsFromSupabase(true);
+          return;
+        }
+
+        const supabase = getSupabase();
+
+        const { data, error } = await supabase
+          .from("materiais_obra")
+          .select("id, nome_obra, nome_material, fornecedor, preco_unitario, quantidade, status")
+          .in("nome_obra", obraNames);
+
+        if (error) throw new Error(error.message);
+
+        const grouped: Record<string, MaterialItem[]> = {};
+        (data as MateriaisObraRow[] | null)?.forEach((row) => {
+          const nomeObra = String(row.nome_obra ?? "").trim();
+          if (!nomeObra) return;
+          const obraId = projectIdByObraName[nomeObra];
+          if (!obraId) return;
+
+          const itemText = String(row.nome_material ?? "").trim();
+          if (!itemText) return;
+
+          const m: MaterialItem = {
+            id: String(row.id ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+            supabaseId: row.id != null ? String(row.id) : undefined,
+            item: itemText,
+            fornecedor: String(row.fornecedor ?? ""),
+            valorCents: typeof row.preco_unitario === "number" ? Math.round(row.preco_unitario * 100) : 0,
+            status: (row.status as MaterialStatus) ?? "cotado",
+            quantidade: typeof row.quantidade === "number" ? row.quantidade : undefined,
+            syncStatus: "synced",
+          };
+
+          grouped[obraId] = grouped[obraId] ? [m, ...grouped[obraId]] : [m];
+        });
+
+        setMaterialsByProject((prev) => ({
+          ...prev,
+          ...grouped,
+        }));
+
+        setHasLoadedMaterialsFromSupabase(true);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao carregar materiais do Supabase";
+        setProjectNotice({ kind: "error", message: `Falha ao sincronizar materiais: ${msg}` });
+        setHasLoadedMaterialsFromSupabase(true);
+      }
+    };
+
+    void load();
+  }, [hasLoadedFromStorage, hasLoadedMaterialsFromSupabase, recentProjects]);
+
+  useEffect(() => {
+    if (!hasLoadedFromStorage) return;
+    if (hasLoadedTeamFromSupabase) return;
+
+    const load = async () => {
+      try {
+        const obraNameByProjectId = recentProjects.reduce<Record<string, string>>((acc, p) => {
+          if (p.id && p.projeto?.trim()) acc[p.id] = p.projeto.trim();
+          return acc;
+        }, {});
+
+        const projectIdByObraName = Object.entries(obraNameByProjectId).reduce<Record<string, string>>((acc, [projectId, obraName]) => {
+          acc[obraName] = projectId;
+          return acc;
+        }, {});
+
+        const obraNames = Object.values(obraNameByProjectId);
+        if (obraNames.length === 0) {
+          setHasLoadedTeamFromSupabase(true);
+          return;
+        }
+
+        const supabase = getSupabase();
+        const { data, error } = await supabase
+          .from("equipe_obra")
+          .select("id, nome_obra, nome_profissional, funcao, valor_diaria, meses_estimados, faltas, contato")
+          .in("nome_obra", obraNames);
+
+        if (error) throw new Error(error.message);
+
+        const grouped: Record<string, TeamMember[]> = {};
+        (data as EquipeObraRow[] | null)?.forEach((row) => {
+          const nomeObra = String(row.nome_obra ?? "").trim();
+          if (!nomeObra) return;
+          const obraId = projectIdByObraName[nomeObra];
+          if (!obraId) return;
+
+          const nome = String(row.nome_profissional ?? "").trim();
+          if (!nome) return;
+
+          const member: TeamMember = {
+            id: String(row.id ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`),
+            supabaseId: row.id != null ? String(row.id) : undefined,
+            nome,
+            funcao: String(row.funcao ?? ""),
+            valorCents: typeof row.valor_diaria === "number" ? Math.round(row.valor_diaria * 100) : 0,
+            mesesEstimados: typeof row.meses_estimados === "number" ? row.meses_estimados : 1,
+            faltas: typeof row.faltas === "number" ? row.faltas : 0,
+            contato: row.contato ? String(row.contato) : undefined,
+            syncStatus: "synced",
+          };
+
+          grouped[obraId] = grouped[obraId] ? [member, ...grouped[obraId]] : [member];
+        });
+
+        setTeamByProject((prev) => ({
+          ...prev,
+          ...grouped,
+        }));
+
+        setHasLoadedTeamFromSupabase(true);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao carregar equipe do Supabase";
+        setProjectNotice({ kind: "error", message: `Falha ao sincronizar equipe: ${msg}` });
+        setHasLoadedTeamFromSupabase(true);
+      }
+    };
+
+    void load();
+  }, [hasLoadedFromStorage, hasLoadedTeamFromSupabase, recentProjects]);
 
   const modalTitleId = useId();
   const inputClienteId = useId();
@@ -452,11 +883,20 @@ export default function Home() {
   }, [teamByProject, selectedProjectId]);
 
   const materialsSpentCents = useMemo(() => {
-    return currentMaterials.reduce((acc, m) => acc + m.valorCents, 0);
+    return currentMaterials.reduce((acc, m) => {
+      const qty = typeof m.quantidade === "number" && Number.isFinite(m.quantidade) ? m.quantidade : 1;
+      return acc + Math.round(qty * m.valorCents);
+    }, 0);
   }, [currentMaterials]);
 
   const teamSpentCents = useMemo(() => {
-    return currentTeam.reduce((acc, t) => acc + t.valorCents, 0);
+    return currentTeam.reduce((acc, t) => {
+      const meses = typeof t.mesesEstimados === "number" && Number.isFinite(t.mesesEstimados) ? t.mesesEstimados : 1;
+      const faltas = typeof t.faltas === "number" && Number.isFinite(t.faltas) ? t.faltas : 0;
+      const planned = 22 * t.valorCents * meses;
+      const adjusted = planned - faltas * t.valorCents;
+      return acc + Math.max(0, adjusted);
+    }, 0);
   }, [currentTeam]);
 
   const currentSpentCents = useMemo(() => {
@@ -488,8 +928,29 @@ export default function Home() {
   }, [diarioByProject, selectedProjectId]);
 
   const absentTeamToday = useMemo(() => {
-    return currentTeam.filter((t) => Boolean(t.faltouHoje));
+    return currentTeam.filter((t) => {
+      const faltas = typeof t.faltas === "number" && Number.isFinite(t.faltas) ? t.faltas : 0;
+      return faltas > 0;
+    });
   }, [currentTeam]);
+
+  const teamPlannedCents = useMemo(() => {
+    return currentTeam.reduce((acc, t) => {
+      const meses = typeof t.mesesEstimados === "number" && Number.isFinite(t.mesesEstimados) ? t.mesesEstimados : 1;
+      return acc + 22 * t.valorCents * meses;
+    }, 0);
+  }, [currentTeam]);
+
+  const teamAbsencesDiscountCents = useMemo(() => {
+    return currentTeam.reduce((acc, t) => {
+      const faltas = typeof t.faltas === "number" && Number.isFinite(t.faltas) ? t.faltas : 0;
+      return acc + faltas * t.valorCents;
+    }, 0);
+  }, [currentTeam]);
+
+  const teamAdjustedCents = useMemo(() => {
+    return Math.max(0, teamPlannedCents - teamAbsencesDiscountCents);
+  }, [teamAbsencesDiscountCents, teamPlannedCents]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -673,6 +1134,9 @@ export default function Home() {
     setLevantamentoError(null);
     setLevantamentoTextSample("");
     setLevantamentoItems([]);
+    setLevantamentoSaveStatus("idle");
+    setLevantamentoSaveMessage(null);
+    setProjectNotice(null);
   }
 
   function goToFirstPendingApprovals() {
@@ -772,9 +1236,36 @@ export default function Home() {
     setLevantamentoItems((prev) => prev.map((it, i) => (i === index ? { ...it, ...patch } : it)));
   }
 
-  function addLevantamentoToMaterials() {
+  async function saveLevantamentoToSupabase(obraId: string, items: LevantamentoItem[]) {
+    const supabase = getSupabase();
+
+    const project = recentProjects.find((p) => p.id === obraId) ?? null;
+    const nomeObra = project?.projeto?.trim() ?? "";
+    if (!nomeObra) throw new Error("Nome da obra ausente para sincronização (campo 'projeto').");
+
+    const rows = items
+      .filter((it) => it.item.trim().length > 0)
+      .map((it) => ({
+        nome_obra: nomeObra,
+        nome_material: `${it.categoria}: ${it.item}`,
+        fornecedor: "Levantamento PDF",
+        preco_unitario: 0,
+        quantidade: typeof it.quantidade === "number" && Number.isFinite(it.quantidade) ? it.quantidade : 1,
+        status: "cotado" as MaterialStatus,
+      }));
+
+    if (rows.length === 0) return;
+
+    const { error } = await supabase.from("materiais_obra").insert(rows);
+    if (error) throw new Error(error.message);
+  }
+
+  async function addLevantamentoToMaterials() {
     if (!selectedProjectId) return;
     if (levantamentoItems.length === 0) return;
+
+    setLevantamentoSaveStatus("saving");
+    setLevantamentoSaveMessage("Salvando no banco de dados...");
 
     const newMaterials: MaterialItem[] = levantamentoItems
       .filter((it) => it.item.trim().length > 0)
@@ -792,12 +1283,29 @@ export default function Home() {
         };
       });
 
+    let savedOk = false;
+
+    try {
+      await saveLevantamentoToSupabase(selectedProjectId, levantamentoItems);
+      setLevantamentoSaveStatus("success");
+      setLevantamentoSaveMessage("Sucesso: materiais salvos no banco de dados.");
+      setProjectNotice({ kind: "success", message: "Sucesso: materiais salvos no banco de dados." });
+      savedOk = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao salvar no Supabase";
+      setLevantamentoSaveStatus("error");
+      setLevantamentoSaveMessage(`Falha ao salvar no banco: ${msg}`);
+      setProjectNotice({ kind: "error", message: `Falha ao salvar no banco: ${msg}` });
+    }
+
     setMaterialsByProject((prev) => {
       const current = prev[selectedProjectId] ?? [];
       return { ...prev, [selectedProjectId]: [...newMaterials, ...current] };
     });
 
-    setActiveTab("materiais");
+    if (savedOk) {
+      setActiveTab("materiais");
+    }
   }
 
   function generateProjectDossier() {
@@ -913,6 +1421,8 @@ export default function Home() {
       valorCents,
       status: materialForm.status,
       contato: materialForm.contato.trim() || undefined,
+      quantidade: 1,
+      syncStatus: "pending",
     };
 
     setMaterialsByProject((prev) => {
@@ -920,6 +1430,38 @@ export default function Home() {
       return { ...prev, [selectedProjectId]: [material, ...current] };
     });
     setMaterialForm({ item: "", fornecedor: "", valor: "", status: "cotado", contato: "" });
+
+    void (async () => {
+      try {
+        const insertedId = await insertMaterialToSupabase(selectedProjectId, material);
+        setMaterialsByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return {
+            ...prev,
+            [selectedProjectId]: current.map((m) =>
+              m.id === material.id
+                ? {
+                    ...m,
+                    supabaseId: insertedId != null ? String(insertedId) : m.supabaseId,
+                    syncStatus: "synced",
+                  }
+                : m,
+            ),
+          };
+        });
+        setProjectNotice({ kind: "success", message: "Sincronizado: material salvo no Supabase." });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao salvar no Supabase";
+        setMaterialsByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return {
+            ...prev,
+            [selectedProjectId]: current.map((m) => (m.id === material.id ? { ...m, syncStatus: "error" } : m)),
+          };
+        });
+        setProjectNotice({ kind: "error", message: `Falha ao sincronizar material: ${msg}` });
+      }
+    })();
   }
 
   function deleteMaterial(id: string) {
@@ -933,6 +1475,9 @@ export default function Home() {
   function saveTeamMember() {
     if (!selectedProjectId) return;
     const valorCents = parseBRLToCents(teamForm.valor);
+    const meses = Number.parseFloat(String(teamForm.mesesEstimados ?? "1").replace(",", "."));
+    const mesesEstimados = Number.isFinite(meses) && meses > 0 ? meses : 1;
+
     if (teamForm.nome.trim().length === 0 || teamForm.funcao.trim().length === 0 || valorCents <= 0) {
       return;
     }
@@ -943,14 +1488,41 @@ export default function Home() {
       funcao: teamForm.funcao.trim(),
       valorCents,
       contato: teamForm.contato.trim() || undefined,
-      faltouHoje: false,
+      mesesEstimados,
+      faltas: 0,
+      syncStatus: "pending",
     };
 
     setTeamByProject((prev) => {
       const current = prev[selectedProjectId] ?? [];
       return { ...prev, [selectedProjectId]: [member, ...current] };
     });
-    setTeamForm({ nome: "", funcao: "", valor: "", contato: "" });
+    setTeamForm({ nome: "", funcao: "", valor: "", mesesEstimados: "1", contato: "" });
+
+    void (async () => {
+      try {
+        const insertedId = await insertTeamMemberToSupabase(selectedProjectId, member);
+        setTeamByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return {
+            ...prev,
+            [selectedProjectId]: current.map((t) =>
+              t.id === member.id
+                ? { ...t, supabaseId: insertedId != null ? String(insertedId) : t.supabaseId, syncStatus: "synced" }
+                : t,
+            ),
+          };
+        });
+        setProjectNotice({ kind: "success", message: "Sincronizado: equipe salva no Supabase." });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Falha ao salvar equipe no Supabase";
+        setTeamByProject((prev) => {
+          const current = prev[selectedProjectId] ?? [];
+          return { ...prev, [selectedProjectId]: current.map((t) => (t.id === member.id ? { ...t, syncStatus: "error" } : t)) };
+        });
+        setProjectNotice({ kind: "error", message: `Falha ao sincronizar equipe: ${msg}` });
+      }
+    })();
   }
 
   function deleteTeamMember(id: string) {
@@ -961,17 +1533,8 @@ export default function Home() {
     });
   }
 
-  function toggleTeamAbsentToday(id: string) {
-    if (!selectedProjectId) return;
-    setTeamByProject((prev) => {
-      const current = prev[selectedProjectId] ?? [];
-      return {
-        ...prev,
-        [selectedProjectId]: current.map((t) =>
-          t.id === id ? { ...t, faltouHoje: !t.faltouHoje } : t
-        ),
-      };
-    });
+  function updateTeamMemberField(id: string, patch: Partial<{ valorCents: number; mesesEstimados: number; faltas: number }>) {
+    scheduleTeamSupabaseUpdate(id, patch);
   }
 
   function saveDiarioEntry() {
@@ -1129,6 +1692,28 @@ export default function Home() {
             </header>
 
             <main>
+              {projectNotice ? (
+                <div
+                  className={
+                    "mb-4 rounded-2xl px-5 py-4 text-sm shadow-sm " +
+                    (projectNotice.kind === "success"
+                      ? "border border-emerald-200 bg-emerald-50 text-emerald-900"
+                      : "border border-red-200 bg-red-50 text-red-800")
+                  }
+                >
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="font-semibold">{projectNotice.kind === "success" ? "Sucesso" : "Falha"}</div>
+                    <div className="flex-1 text-zinc-700">{projectNotice.message}</div>
+                    <button
+                      type="button"
+                      onClick={() => setProjectNotice(null)}
+                      className="rounded-full border border-zinc-200 bg-white px-3 py-1.5 text-xs font-semibold text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                    >
+                      Fechar
+                    </button>
+                  </div>
+                </div>
+              ) : null}
               {activeTab === "prioridades" ? (
                 <div className="flex flex-col gap-6">
                   <div className="rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm">
@@ -1418,7 +2003,11 @@ export default function Home() {
                         <tr className="text-left text-xs font-semibold uppercase tracking-wide text-zinc-500">
                           <th className="px-5 py-3">Item</th>
                           <th className="px-5 py-3">Fornecedor</th>
+                          <th className="px-5 py-3 text-right">Qtd</th>
+                          <th className="px-5 py-3 text-right">Preço Unit.</th>
                           <th className="px-5 py-3">Status</th>
+                          <th className="px-5 py-3">Sync</th>
+                          <th className="px-5 py-3 text-right">Total</th>
                           <th className="px-5 py-3 text-right">Valor</th>
                           <th className="px-5 py-3 text-right">Contato</th>
                           <th className="px-5 py-3 text-right">Ações</th>
@@ -1429,7 +2018,69 @@ export default function Home() {
                           <tr key={m.id} className="bg-white">
                             <td className="px-5 py-4 text-sm font-medium text-zinc-900">{m.item}</td>
                             <td className="px-5 py-4 text-sm text-zinc-700">{m.fornecedor}</td>
-                            <td className="px-5 py-4 text-sm text-zinc-700">{m.status}</td>
+                            <td className="px-5 py-4 text-right">
+                              <input
+                                value={typeof m.quantidade === "number" ? String(m.quantidade) : "1"}
+                                onChange={(e) => {
+                                  const v = e.target.value.trim();
+                                  const n = v.length === 0 ? 1 : Number.parseFloat(v.replace(",", "."));
+                                  const nextQty = Number.isFinite(n) && n > 0 ? n : 1;
+                                  scheduleMaterialSupabaseUpdate(m.id, { quantidade: nextQty });
+                                }}
+                                className="h-9 w-24 rounded-xl border border-zinc-200 bg-white px-3 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                                inputMode="decimal"
+                              />
+                            </td>
+                            <td className="px-5 py-4 text-right">
+                              <input
+                                value={formatCentsToBRL(m.valorCents)}
+                                onChange={(e) => {
+                                  const next = formatBRLInput(e.target.value);
+                                  const cents = parseBRLToCents(next.text);
+                                  scheduleMaterialSupabaseUpdate(m.id, { valorCents: cents });
+                                }}
+                                className="h-9 w-32 rounded-xl border border-zinc-200 bg-white px-3 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                                inputMode="decimal"
+                              />
+                            </td>
+                            <td className="px-5 py-4">
+                              <select
+                                value={m.status}
+                                onChange={(e) => updateMaterialStatus(m.id, e.target.value as MaterialStatus)}
+                                className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                              >
+                                <option value="cotado">Cotado</option>
+                                <option value="comprado">Comprado</option>
+                                <option value="entregue">Entregue</option>
+                              </select>
+                            </td>
+                            <td className="px-5 py-4">
+                              <div className="inline-flex items-center gap-2 text-xs font-semibold">
+                                {m.syncStatus === "synced" ? (
+                                  <>
+                                    <CloudCheck className="h-4 w-4 text-emerald-600" aria-hidden="true" />
+                                    <span className="text-emerald-700">Sincronizado</span>
+                                  </>
+                                ) : m.syncStatus === "error" ? (
+                                  <>
+                                    <CloudAlert className="h-4 w-4 text-red-600" aria-hidden="true" />
+                                    <span className="text-red-700">Falha</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <CloudUpload className="h-4 w-4 text-zinc-500" aria-hidden="true" />
+                                    <span className="text-zinc-600">Pendente</span>
+                                  </>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-5 py-4 text-right text-sm font-semibold text-zinc-900">
+                              {formatCentsToBRL(
+                                Math.round(
+                                  (typeof m.quantidade === "number" && Number.isFinite(m.quantidade) ? m.quantidade : 1) * m.valorCents,
+                                ),
+                              )}
+                            </td>
                             <td className="px-5 py-4 text-right text-sm font-semibold text-zinc-900">{formatCentsToBRL(m.valorCents)}</td>
                             <td className="px-5 py-4 text-right">
                               <div className="inline-flex items-center gap-2">
@@ -1493,6 +2144,24 @@ export default function Home() {
                     </div>
                   </div>
 
+                  <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
+                    <div className="rounded-2xl border border-zinc-200 bg-white p-4">
+                      <div className="text-sm font-medium text-zinc-600">Custo previsto (equipe)</div>
+                      <div className="mt-1 text-lg font-semibold text-zinc-900">{formatCentsToBRL(teamPlannedCents)}</div>
+                      <div className="mt-2 text-xs text-zinc-500">Base: 22 dias/mês × diária × meses.</div>
+                    </div>
+                    <div className="rounded-2xl border border-zinc-200 bg-white p-4">
+                      <div className="text-sm font-medium text-zinc-600">Abatimento por faltas</div>
+                      <div className="mt-1 text-lg font-semibold text-zinc-900">- {formatCentsToBRL(teamAbsencesDiscountCents)}</div>
+                      <div className="mt-2 text-xs text-zinc-500">Cada falta abate 1 diária.</div>
+                    </div>
+                    <div className="rounded-2xl border border-zinc-200 bg-white p-4">
+                      <div className="text-sm font-medium text-zinc-600">Custo ajustado</div>
+                      <div className="mt-1 text-lg font-semibold text-zinc-900">{formatCentsToBRL(teamAdjustedCents)}</div>
+                      <div className="mt-2 text-xs text-zinc-500">Saldo atualizado conforme faltas.</div>
+                    </div>
+                  </div>
+
                   <form
                     className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-6"
                     onSubmit={(e) => {
@@ -1519,7 +2188,14 @@ export default function Home() {
                         setTeamForm((s) => ({ ...s, valor: next.text }));
                       }}
                       className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
-                      placeholder="Valor"
+                      placeholder="Valor da diária"
+                      inputMode="decimal"
+                    />
+                    <input
+                      value={teamForm.mesesEstimados}
+                      onChange={(e) => setTeamForm((s) => ({ ...s, mesesEstimados: e.target.value }))}
+                      className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                      placeholder="Meses"
                       inputMode="decimal"
                     />
                     <input
@@ -1544,8 +2220,10 @@ export default function Home() {
                         <tr className="text-left text-xs font-semibold uppercase tracking-wide text-zinc-500">
                           <th className="px-5 py-3">Nome</th>
                           <th className="px-5 py-3">Função</th>
-                          <th className="px-5 py-3 text-right">Valor</th>
-                          <th className="px-5 py-3 text-right">Faltou hoje</th>
+                          <th className="px-5 py-3 text-right">Diária</th>
+                          <th className="px-5 py-3 text-right">Meses</th>
+                          <th className="px-5 py-3 text-right">Faltas</th>
+                          <th className="px-5 py-3 text-right">Total</th>
                           <th className="px-5 py-3 text-right">Contato</th>
                           <th className="px-5 py-3 text-right">Ações</th>
                         </tr>
@@ -1555,19 +2233,52 @@ export default function Home() {
                           <tr key={t.id} className="bg-white">
                             <td className="px-5 py-4 text-sm font-medium text-zinc-900">{t.nome}</td>
                             <td className="px-5 py-4 text-sm text-zinc-700">{t.funcao}</td>
-                            <td className="px-5 py-4 text-right text-sm font-semibold text-zinc-900">{formatCentsToBRL(t.valorCents)}</td>
                             <td className="px-5 py-4 text-right">
-                              <button
-                                type="button"
-                                onClick={() => toggleTeamAbsentToday(t.id)}
-                                className={
-                                  t.faltouHoje
-                                    ? "rounded-full bg-[#D4AF37] px-3 py-2 text-xs font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
-                                    : "rounded-full border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-700 shadow-sm transition-colors hover:bg-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
-                                }
-                              >
-                                {t.faltouHoje ? "Sim" : "Não"}
-                              </button>
+                              <input
+                                value={formatCentsToBRL(t.valorCents)}
+                                onChange={(e) => {
+                                  const next = formatBRLInput(e.target.value);
+                                  const cents = parseBRLToCents(next.text);
+                                  updateTeamMemberField(t.id, { valorCents: cents });
+                                }}
+                                className="h-9 w-32 rounded-xl border border-zinc-200 bg-white px-3 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                                inputMode="decimal"
+                              />
+                            </td>
+                            <td className="px-5 py-4 text-right">
+                              <input
+                                value={String(typeof t.mesesEstimados === "number" ? t.mesesEstimados : 1)}
+                                onChange={(e) => {
+                                  const v = e.target.value.trim();
+                                  const n = v.length === 0 ? 1 : Number.parseFloat(v.replace(",", "."));
+                                  const nextMeses = Number.isFinite(n) && n > 0 ? n : 1;
+                                  updateTeamMemberField(t.id, { mesesEstimados: nextMeses });
+                                }}
+                                className="h-9 w-24 rounded-xl border border-zinc-200 bg-white px-3 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                                inputMode="decimal"
+                              />
+                            </td>
+                            <td className="px-5 py-4 text-right">
+                              <input
+                                value={String(typeof t.faltas === "number" ? t.faltas : 0)}
+                                onChange={(e) => {
+                                  const v = e.target.value.trim();
+                                  const n = v.length === 0 ? 0 : Number.parseInt(v, 10);
+                                  const nextFaltas = Number.isFinite(n) && n >= 0 ? n : 0;
+                                  updateTeamMemberField(t.id, { faltas: nextFaltas });
+                                }}
+                                className="h-9 w-20 rounded-xl border border-zinc-200 bg-white px-3 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                                inputMode="numeric"
+                              />
+                            </td>
+                            <td className="px-5 py-4 text-right text-sm font-semibold text-zinc-900">
+                              {formatCentsToBRL(
+                                Math.max(
+                                  0,
+                                  22 * t.valorCents * (typeof t.mesesEstimados === "number" ? t.mesesEstimados : 1) -
+                                    (typeof t.faltas === "number" ? t.faltas : 0) * t.valorCents,
+                                ),
+                              )}
                             </td>
                             <td className="px-5 py-4 text-right">
                               <div className="inline-flex items-center gap-2">
@@ -1674,6 +2385,21 @@ export default function Home() {
                         {levantamentoError ? (
                           <div className="mt-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
                             {levantamentoError}
+                          </div>
+                        ) : null}
+
+                        {levantamentoSaveStatus !== "idle" && levantamentoSaveMessage ? (
+                          <div
+                            className={
+                              "mt-3 rounded-xl px-4 py-3 text-sm " +
+                              (levantamentoSaveStatus === "success"
+                                ? "border border-emerald-200 bg-emerald-50 text-emerald-900"
+                                : levantamentoSaveStatus === "error"
+                                  ? "border border-red-200 bg-red-50 text-red-800"
+                                  : "border border-zinc-200 bg-white text-zinc-700")
+                            }
+                          >
+                            {levantamentoSaveMessage}
                           </div>
                         ) : null}
                       </div>
@@ -1792,6 +2518,7 @@ export default function Home() {
                             <button
                               type="button"
                               onClick={addLevantamentoToMaterials}
+                              disabled={levantamentoSaveStatus === "saving"}
                               className="rounded-full bg-[#D4AF37] px-4 py-2 text-xs font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
                             >
                               Confirmar e inserir em Materiais
