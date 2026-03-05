@@ -121,9 +121,10 @@ type TeamMember = {
   supabaseId?: string;
   nome: string;
   funcao: string;
-  valorCents: number; // diária
+  valorCents: number;
   mesesEstimados?: number;
   faltas?: number;
+  prazo?: string;
   contato?: string;
   syncStatus?: SyncStatus;
 };
@@ -136,6 +137,7 @@ type EquipeObraRow = {
   valor_diaria?: number | null;
   meses_estimados?: number | null;
   faltas?: number | null;
+  prazo?: string | null;
   contato?: string | null;
 };
 
@@ -259,6 +261,18 @@ function toJitsiRoomName(projectName: string) {
     .trim()
     .replace(/\s+/g, "-");
   return `Obra-${normalized.length === 0 ? "Projeto" : normalized}`;
+}
+
+function formatDateBR(date: Date) {
+  return new Intl.DateTimeFormat("pt-BR", { day: "2-digit", month: "2-digit", year: "numeric" }).format(date);
+}
+
+function parsePrazoDate(value: string) {
+  const raw = value.trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
 }
 
 function downloadTextFile(filename: string, content: string) {
@@ -402,14 +416,19 @@ export default function Home() {
     contato: "",
   });
 
+  const [isSavingMaterial, setIsSavingMaterial] = useState(false);
+
   const [teamByProject, setTeamByProject] = useState<Record<string, TeamMember[]>>({});
   const [teamForm, setTeamForm] = useState({
     nome: "",
     funcao: "",
     valor: "",
     mesesEstimados: "1",
+    prazo: "",
     contato: "",
   });
+
+  const [isSavingTeamMember, setIsSavingTeamMember] = useState(false);
 
   const [storeDomains, setStoreDomains] = useState<string[]>([
     "https://www.leroymerlin.com.br",
@@ -626,7 +645,7 @@ export default function Home() {
     const nomeObra = project?.projeto?.trim() ?? "";
     if (!nomeObra) throw new Error("Nome da obra ausente para sincronização (campo 'projeto').");
 
-    const payload = {
+    const basePayload = {
       nome_obra: nomeObra,
       nome_profissional: member.nome,
       funcao: member.funcao,
@@ -636,19 +655,58 @@ export default function Home() {
       contato: member.contato ?? null,
     };
 
-    const { data, error } = await supabase.from("equipe_obra").insert(payload).select("id").single();
-    if (error) throw new Error(error.message);
-    return (data as { id: string | number } | null)?.id ?? null;
+    const withPrazo = {
+      ...basePayload,
+      ...(member.prazo ? { prazo: member.prazo } : null),
+    };
+
+    const tryInsert = async (payload: Record<string, unknown>) => {
+      const { data, error } = await supabase.from("equipe_obra").insert(payload).select("id").single();
+      if (error) throw new Error(error.message);
+      return (data as { id: string | number } | null)?.id ?? null;
+    };
+
+    try {
+      return await tryInsert(withPrazo);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao inserir equipe";
+      if (/column\s+"prazo"/i.test(msg) || /prazo/i.test(msg)) {
+        return await tryInsert(basePayload as unknown as Record<string, unknown>);
+      }
+      throw err;
+    }
   }
 
-  async function updateTeamMemberInSupabase(member: TeamMember, patch: Partial<{ valor_diaria: number; meses_estimados: number; faltas: number }>) {
+  async function updateTeamMemberInSupabase(
+    member: TeamMember,
+    patch: Partial<{ valor_diaria: number; meses_estimados: number; faltas: number; prazo: string | null }>,
+  ) {
     const supabase = getSupabase();
     if (!member.supabaseId) throw new Error("Membro ainda não possui ID do Supabase.");
-    const { error } = await supabase.from("equipe_obra").update(patch).eq("id", member.supabaseId);
-    if (error) throw new Error(error.message);
+
+    const tryUpdate = async (payload: Record<string, unknown>) => {
+      const { error } = await supabase.from("equipe_obra").update(payload).eq("id", member.supabaseId);
+      if (error) throw new Error(error.message);
+    };
+
+    try {
+      await tryUpdate(patch as unknown as Record<string, unknown>);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao atualizar equipe";
+      if ((/column\s+"prazo"/i.test(msg) || /prazo/i.test(msg)) && "prazo" in patch) {
+        const rest = { ...(patch as Record<string, unknown>) };
+        delete rest.prazo;
+        await tryUpdate(rest);
+        return;
+      }
+      throw err;
+    }
   }
 
-  function scheduleTeamSupabaseUpdate(memberId: string, patch: Partial<{ valorCents: number; mesesEstimados: number; faltas: number }>) {
+  function scheduleTeamSupabaseUpdate(
+    memberId: string,
+    patch: Partial<{ valorCents: number; mesesEstimados: number; faltas: number; prazo: string }>,
+  ) {
     if (!selectedProjectId) return;
     const target = (teamByProject[selectedProjectId] ?? []).find((t) => t.id === memberId) ?? null;
     if (!target) return;
@@ -664,6 +722,7 @@ export default function Home() {
                 ...("valorCents" in patch ? { valorCents: patch.valorCents ?? t.valorCents } : null),
                 ...("mesesEstimados" in patch ? { mesesEstimados: patch.mesesEstimados } : null),
                 ...("faltas" in patch ? { faltas: patch.faltas } : null),
+                ...("prazo" in patch ? { prazo: patch.prazo } : null),
                 syncStatus: t.supabaseId ? "pending" : t.syncStatus,
               }
             : t,
@@ -682,11 +741,13 @@ export default function Home() {
           const nextDiaria = typeof patch.valorCents === "number" ? patch.valorCents / 100 : target.valorCents / 100;
           const nextMeses = typeof patch.mesesEstimados === "number" ? patch.mesesEstimados : target.mesesEstimados ?? 1;
           const nextFaltas = typeof patch.faltas === "number" ? patch.faltas : target.faltas ?? 0;
+          const nextPrazo = typeof patch.prazo === "string" ? patch.prazo : target.prazo ?? null;
 
           await updateTeamMemberInSupabase(target, {
             valor_diaria: nextDiaria,
             meses_estimados: nextMeses,
             faltas: nextFaltas,
+            prazo: nextPrazo,
           });
 
           setTeamByProject((prev) => {
@@ -867,15 +928,26 @@ export default function Home() {
         }
 
         const supabase = getSupabase();
-        const { data, error } = await supabase
-          .from("equipe_obra")
-          .select("id, nome_obra, nome_profissional, funcao, valor_diaria, meses_estimados, faltas, contato")
-          .in("nome_obra", obraNames);
+        const trySelect = async (select: string) => {
+          const { data, error } = await supabase.from("equipe_obra").select(select).in("nome_obra", obraNames);
+          if (error) throw new Error(error.message);
+          return data as unknown as EquipeObraRow[] | null;
+        };
 
-        if (error) throw new Error(error.message);
+        let data: EquipeObraRow[] | null = null;
+        try {
+          data = await trySelect("id, nome_obra, nome_profissional, funcao, valor_diaria, meses_estimados, faltas, prazo, contato");
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : "Falha ao carregar equipe do Supabase";
+          if (/column\s+"prazo"/i.test(msg) || /prazo/i.test(msg)) {
+            data = await trySelect("id, nome_obra, nome_profissional, funcao, valor_diaria, meses_estimados, faltas, contato");
+          } else {
+            throw err;
+          }
+        }
 
         const grouped: Record<string, TeamMember[]> = {};
-        (data as EquipeObraRow[] | null)?.forEach((row) => {
+        data?.forEach((row) => {
           const nomeObra = String(row.nome_obra ?? "").trim();
           if (!nomeObra) return;
           const obraId = projectIdByObraName[nomeObra];
@@ -892,6 +964,7 @@ export default function Home() {
             valorCents: typeof row.valor_diaria === "number" ? Math.round(row.valor_diaria * 100) : 0,
             mesesEstimados: typeof row.meses_estimados === "number" ? row.meses_estimados : 1,
             faltas: typeof row.faltas === "number" ? row.faltas : 0,
+            prazo: row.prazo ? String(row.prazo) : undefined,
             contato: row.contato ? String(row.contato) : undefined,
             syncStatus: "synced",
           };
@@ -1065,20 +1138,62 @@ export default function Home() {
   const teamPlannedCents = useMemo(() => {
     return currentTeam.reduce((acc, t) => {
       const meses = typeof t.mesesEstimados === "number" && Number.isFinite(t.mesesEstimados) ? t.mesesEstimados : 1;
-      return acc + 22 * t.valorCents * meses;
+      return acc + t.valorCents * meses;
     }, 0);
   }, [currentTeam]);
 
   const teamAbsencesDiscountCents = useMemo(() => {
     return currentTeam.reduce((acc, t) => {
       const faltas = typeof t.faltas === "number" && Number.isFinite(t.faltas) ? t.faltas : 0;
-      return acc + faltas * t.valorCents;
+      const mensal = t.valorCents;
+      const daily = mensal > 0 ? Math.max(1, Math.round(mensal / 22)) : 0;
+      return acc + faltas * daily;
     }, 0);
   }, [currentTeam]);
 
   const teamAdjustedCents = useMemo(() => {
     return Math.max(0, teamPlannedCents - teamAbsencesDiscountCents);
   }, [teamAbsencesDiscountCents, teamPlannedCents]);
+
+  const globalNextDeadline = useMemo(() => {
+    const projectNameById = recentProjects.reduce<Record<string, string>>((acc, p) => {
+      if (p.id && p.projeto?.trim()) acc[p.id] = p.projeto.trim();
+      return acc;
+    }, {});
+
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    const candidates: Array<{ date: Date; memberName: string; role: string; projectName: string }> = [];
+
+    Object.entries(teamByProject).forEach(([projectId, team]) => {
+      const projectName = projectNameById[projectId] ?? "";
+      team.forEach((m) => {
+        const d = m.prazo ? parsePrazoDate(m.prazo) : null;
+        if (!d) return;
+        if (d.getTime() < startOfToday.getTime()) return;
+        candidates.push({ date: d, memberName: m.nome, role: m.funcao, projectName });
+      });
+    });
+
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => a.date.getTime() - b.date.getTime());
+    const picked = candidates[0];
+    if (!picked) return null;
+
+    const daysLeft = Math.max(
+      0,
+      Math.ceil((picked.date.getTime() - startOfToday.getTime()) / (24 * 60 * 60 * 1000)),
+    );
+
+    return {
+      date: picked.date,
+      memberName: picked.memberName,
+      role: picked.role,
+      projectName: picked.projectName,
+      daysLeft,
+    };
+  }, [recentProjects, teamByProject]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -1597,6 +1712,7 @@ export default function Home() {
 
   function saveMaterial() {
     if (!selectedProjectId) return;
+    if (isSavingMaterial) return;
     const valorCents = parseBRLToCents(materialForm.valor);
     const quantidadeParsed = Number.parseFloat(String(materialForm.quantidade ?? "1").replace(",", "."));
     const quantidade = Number.isFinite(quantidadeParsed) && quantidadeParsed > 0 ? quantidadeParsed : 1;
@@ -1628,6 +1744,7 @@ export default function Home() {
     setMaterialForm({ item: "", fornecedor: "", quantidade: "1", unidade: "un", valor: "", status: "orcado", contato: "" });
 
     void (async () => {
+      setIsSavingMaterial(true);
       try {
         const insertedId = await insertMaterialToSupabase(selectedProjectId, material);
         setMaterialsByProject((prev) => {
@@ -1656,6 +1773,8 @@ export default function Home() {
           };
         });
         setProjectNotice({ kind: "error", message: `Falha ao sincronizar material: ${msg}` });
+      } finally {
+        setIsSavingMaterial(false);
       }
     })();
   }
@@ -1670,9 +1789,11 @@ export default function Home() {
 
   function saveTeamMember() {
     if (!selectedProjectId) return;
+    if (isSavingTeamMember) return;
     const valorCents = parseBRLToCents(teamForm.valor);
     const meses = Number.parseFloat(String(teamForm.mesesEstimados ?? "1").replace(",", "."));
     const mesesEstimados = Number.isFinite(meses) && meses > 0 ? meses : 1;
+    const prazo = String(teamForm.prazo ?? "").trim();
 
     if (teamForm.nome.trim().length === 0 || teamForm.funcao.trim().length === 0 || valorCents <= 0) {
       return;
@@ -1686,6 +1807,7 @@ export default function Home() {
       contato: teamForm.contato.trim() || undefined,
       mesesEstimados,
       faltas: 0,
+      prazo: prazo || undefined,
       syncStatus: "pending",
     };
 
@@ -1693,9 +1815,10 @@ export default function Home() {
       const current = prev[selectedProjectId] ?? [];
       return { ...prev, [selectedProjectId]: [member, ...current] };
     });
-    setTeamForm({ nome: "", funcao: "", valor: "", mesesEstimados: "1", contato: "" });
+    setTeamForm({ nome: "", funcao: "", valor: "", mesesEstimados: "1", prazo: "", contato: "" });
 
     void (async () => {
+      setIsSavingTeamMember(true);
       try {
         const insertedId = await insertTeamMemberToSupabase(selectedProjectId, member);
         setTeamByProject((prev) => {
@@ -1717,6 +1840,8 @@ export default function Home() {
           return { ...prev, [selectedProjectId]: current.map((t) => (t.id === member.id ? { ...t, syncStatus: "error" } : t)) };
         });
         setProjectNotice({ kind: "error", message: `Falha ao sincronizar equipe: ${msg}` });
+      } finally {
+        setIsSavingTeamMember(false);
       }
     })();
   }
@@ -1731,6 +1856,10 @@ export default function Home() {
 
   function updateTeamMemberField(id: string, patch: Partial<{ valorCents: number; mesesEstimados: number; faltas: number }>) {
     scheduleTeamSupabaseUpdate(id, patch);
+  }
+
+  function updateTeamMemberPrazo(id: string, prazo: string) {
+    scheduleTeamSupabaseUpdate(id, { prazo });
   }
 
   async function searchPricesForMaterial(materialId: string, query: string) {
@@ -2244,6 +2373,7 @@ export default function Home() {
                     className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-8"
                     onSubmit={(e) => {
                       e.preventDefault();
+                      if (isSavingMaterial) return;
                       saveMaterial();
                     }}
                   >
@@ -2305,9 +2435,13 @@ export default function Home() {
                     <div className="md:col-span-8 md:flex md:justify-end">
                       <button
                         type="submit"
-                        className="h-11 w-full rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto"
+                        disabled={isSavingMaterial}
+                        className={
+                          "relative z-10 h-11 w-full touch-manipulation rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto " +
+                          (isSavingMaterial ? "opacity-70" : "")
+                        }
                       >
-                        Adicionar
+                        {isSavingMaterial ? "Salvando..." : "Adicionar"}
                       </button>
                     </div>
                   </form>
@@ -2572,12 +2706,12 @@ export default function Home() {
                     <div className="rounded-2xl border border-zinc-200 bg-white p-4">
                       <div className="text-sm font-medium text-zinc-600">Custo previsto (equipe)</div>
                       <div className="mt-1 text-lg font-semibold text-zinc-900">{formatCentsToBRL(teamPlannedCents)}</div>
-                      <div className="mt-2 text-xs text-zinc-500">Base: 22 dias/mês × diária × meses.</div>
+                      <div className="mt-2 text-xs text-zinc-500">Base: valor × meses.</div>
                     </div>
                     <div className="rounded-2xl border border-zinc-200 bg-white p-4">
                       <div className="text-sm font-medium text-zinc-600">Abatimento por faltas</div>
                       <div className="mt-1 text-lg font-semibold text-zinc-900">- {formatCentsToBRL(teamAbsencesDiscountCents)}</div>
-                      <div className="mt-2 text-xs text-zinc-500">Cada falta abate 1 diária.</div>
+                      <div className="mt-2 text-xs text-zinc-500">Cada falta abate 1/22 do valor.</div>
                     </div>
                     <div className="rounded-2xl border border-zinc-200 bg-white p-4">
                       <div className="text-sm font-medium text-zinc-600">Custo ajustado</div>
@@ -2612,8 +2746,15 @@ export default function Home() {
                         setTeamForm((s) => ({ ...s, valor: next.text }));
                       }}
                       className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
-                      placeholder="Valor da diária"
+                      placeholder="Valor"
                       inputMode="decimal"
+                    />
+                    <input
+                      value={teamForm.prazo}
+                      onChange={(e) => setTeamForm((s) => ({ ...s, prazo: e.target.value }))}
+                      className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                      placeholder="Prazo"
+                      type="date"
                     />
                     <input
                       value={teamForm.mesesEstimados}
@@ -2631,12 +2772,98 @@ export default function Home() {
                     <div className="md:col-span-6 md:flex md:justify-end">
                       <button
                         type="submit"
-                        className="h-11 w-full rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto"
+                        disabled={isSavingTeamMember}
+                        className={
+                          "relative z-10 h-11 w-full touch-manipulation rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto " +
+                          (isSavingTeamMember ? "opacity-70" : "")
+                        }
                       >
-                        Adicionar
+                        {isSavingTeamMember ? "Salvando..." : "Adicionar"}
                       </button>
                     </div>
                   </form>
+
+                  <div className="mt-6 rounded-2xl border border-zinc-200 bg-white p-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <div className="text-sm font-semibold text-zinc-900">Calendário de prazos</div>
+                        <div className="mt-1 text-xs text-zinc-600">Visualize entregas por dia no mês atual.</div>
+                      </div>
+                      <div className="text-xs font-medium text-zinc-600">{formatDateBR(new Date()).slice(3)}</div>
+                    </div>
+
+                    {(() => {
+                      const now = new Date();
+                      const year = now.getFullYear();
+                      const month = now.getMonth();
+                      const firstDay = new Date(year, month, 1);
+                      const startWeekday = firstDay.getDay();
+                      const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+                      const byDay = currentTeam.reduce<Record<number, TeamMember[]>>((acc, m) => {
+                        const d = m.prazo ? parsePrazoDate(m.prazo) : null;
+                        if (!d) return acc;
+                        if (d.getFullYear() !== year || d.getMonth() !== month) return acc;
+                        const day = d.getDate();
+                        acc[day] = acc[day] ? [...acc[day], m] : [m];
+                        return acc;
+                      }, {});
+
+                      const cells: Array<{ kind: "empty" } | { kind: "day"; day: number }> = [];
+                      for (let i = 0; i < ((startWeekday + 6) % 7); i += 1) cells.push({ kind: "empty" });
+                      for (let d = 1; d <= daysInMonth; d += 1) cells.push({ kind: "day", day: d });
+
+                      return (
+                        <div className="mt-4">
+                          <div className="grid grid-cols-7 gap-2 text-[11px] font-semibold text-zinc-500">
+                            <div className="text-center">Seg</div>
+                            <div className="text-center">Ter</div>
+                            <div className="text-center">Qua</div>
+                            <div className="text-center">Qui</div>
+                            <div className="text-center">Sex</div>
+                            <div className="text-center">Sáb</div>
+                            <div className="text-center">Dom</div>
+                          </div>
+                          <div className="mt-2 grid grid-cols-7 gap-2">
+                            {cells.map((c, idx) => {
+                              if (c.kind === "empty") {
+                                return <div key={`empty-${idx}`} className="h-14 rounded-xl border border-transparent" />;
+                              }
+                              const items = byDay[c.day] ?? [];
+                              const isToday = c.day === now.getDate();
+                              return (
+                                <div
+                                  key={`day-${c.day}`}
+                                  className={
+                                    "h-14 rounded-xl border px-2 py-1 " +
+                                    (isToday
+                                      ? "border-[#D4AF37]/50 bg-[#D4AF37]/5"
+                                      : "border-zinc-200 bg-white")
+                                  }
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <div className="text-xs font-semibold text-zinc-900">{c.day}</div>
+                                    {items.length > 0 ? (
+                                      <div className="rounded-full bg-[#D4AF37]/15 px-2 py-0.5 text-[10px] font-semibold text-zinc-900">
+                                        {items.length}
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                  {items.length > 0 ? (
+                                    <div className="mt-1 line-clamp-1 text-[11px] font-medium text-zinc-700">
+                                      {items[0].funcao}
+                                    </div>
+                                  ) : (
+                                    <div className="mt-1 text-[11px] text-zinc-400">-</div>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
 
                   <div className="mt-6 overflow-x-auto rounded-2xl border border-zinc-200">
                     <table className="w-full">
@@ -2644,9 +2871,10 @@ export default function Home() {
                         <tr className="text-left text-xs font-semibold uppercase tracking-wide text-zinc-500">
                           <th className="px-5 py-3">Nome</th>
                           <th className="px-5 py-3">Função</th>
-                          <th className="px-5 py-3 text-right">Diária</th>
+                          <th className="px-5 py-3 text-right">Valor</th>
                           <th className="px-5 py-3 text-right">Meses</th>
                           <th className="px-5 py-3 text-right">Faltas</th>
+                          <th className="px-5 py-3 text-right">Prazo</th>
                           <th className="px-5 py-3 text-right">Total</th>
                           <th className="px-5 py-3 text-right">Contato</th>
                           <th className="px-5 py-3 text-right">Ações</th>
@@ -2695,12 +2923,21 @@ export default function Home() {
                                 inputMode="numeric"
                               />
                             </td>
+                            <td className="px-5 py-4 text-right">
+                              <input
+                                value={t.prazo ?? ""}
+                                onChange={(e) => updateTeamMemberPrazo(t.id, e.target.value)}
+                                className="h-9 w-36 rounded-xl border border-zinc-200 bg-white px-3 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                                type="date"
+                              />
+                            </td>
                             <td className="px-5 py-4 text-right text-sm font-semibold text-zinc-900">
                               {formatCentsToBRL(
                                 Math.max(
                                   0,
-                                  22 * t.valorCents * (typeof t.mesesEstimados === "number" ? t.mesesEstimados : 1) -
-                                    (typeof t.faltas === "number" ? t.faltas : 0) * t.valorCents,
+                                  t.valorCents * (typeof t.mesesEstimados === "number" ? t.mesesEstimados : 1) -
+                                    (typeof t.faltas === "number" ? t.faltas : 0) *
+                                      (t.valorCents > 0 ? Math.max(1, Math.round(t.valorCents / 22)) : 0),
                                 ),
                               )}
                             </td>
@@ -3210,6 +3447,14 @@ export default function Home() {
                   </div>
 
                   <div className="mt-6 flex flex-col gap-3">
+                    {globalNextDeadline ? (
+                      <HighlightItem
+                        title={`Faltam ${globalNextDeadline.daysLeft} dia(s) para a entrega`}
+                        subtitle={`${globalNextDeadline.role} · ${globalNextDeadline.memberName} · ${formatDateBR(globalNextDeadline.date)}${
+                          globalNextDeadline.projectName ? ` · ${globalNextDeadline.projectName}` : ""
+                        }`}
+                      />
+                    ) : null}
                     <HighlightActionItem
                       title="Aprovar materiais"
                       subtitle={`${globalMaterialsToApproveCount} itens cotados aguardando aprovação`}
