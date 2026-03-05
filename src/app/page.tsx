@@ -79,7 +79,7 @@ type DiarioEntry = {
   mudancas: string;
 };
 
-type MaterialStatus = "cotado" | "comprado" | "entregue";
+type MaterialStatus = "orcado" | "comprado" | "entregue";
 
 type SyncStatus = "pending" | "synced" | "error";
 
@@ -90,7 +90,8 @@ type MateriaisObraRow = {
   fornecedor?: string | null;
   preco_unitario?: number | null;
   quantidade?: number | null;
-  status?: MaterialStatus | null;
+  unidade?: string | null;
+  status?: MaterialStatus | "cotado" | null;
 };
 
 type MaterialItem = {
@@ -102,6 +103,7 @@ type MaterialItem = {
   status: MaterialStatus;
   contato?: string;
   quantidade?: number;
+  unidade?: string;
   syncStatus?: SyncStatus;
 };
 
@@ -362,8 +364,10 @@ export default function Home() {
   const [materialForm, setMaterialForm] = useState({
     item: "",
     fornecedor: "",
+    quantidade: "1",
+    unidade: "un",
     valor: "",
-    status: "cotado" as MaterialStatus,
+    status: "orcado" as MaterialStatus,
     contato: "",
   });
 
@@ -409,7 +413,7 @@ export default function Home() {
     const nomeObra = project?.projeto?.trim() ?? "";
     if (!nomeObra) throw new Error("Nome da obra ausente para sincronização (campo 'projeto').");
 
-    const payload = {
+    const basePayload = {
       nome_obra: nomeObra,
       nome_material: material.item,
       fornecedor: material.fornecedor,
@@ -418,9 +422,26 @@ export default function Home() {
       status: material.status,
     };
 
-    const { data, error } = await supabase.from("materiais_obra").insert(payload).select("id").single();
-    if (error) throw new Error(error.message);
-    return (data as { id: string | number } | null)?.id ?? null;
+    const withUnidade = {
+      ...basePayload,
+      ...(material.unidade ? { unidade: material.unidade } : null),
+    };
+
+    const tryInsert = async (payload: Record<string, unknown>) => {
+      const { data, error } = await supabase.from("materiais_obra").insert(payload).select("id").single();
+      if (error) throw new Error(error.message);
+      return (data as { id: string | number } | null)?.id ?? null;
+    };
+
+    try {
+      return await tryInsert(withUnidade);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Falha ao inserir material";
+      if (/column\s+"unidade"/i.test(msg) || /unidade/i.test(msg)) {
+        return await tryInsert(basePayload as unknown as Record<string, unknown>);
+      }
+      throw err;
+    }
   }
 
   async function updateMaterialFieldsInSupabase(material: MaterialItem, patch: { quantidade?: number; preco_unitario?: number }) {
@@ -689,18 +710,22 @@ export default function Home() {
           const itemText = String(row.nome_material ?? "").trim();
           if (!itemText) return;
 
-          const m: MaterialItem = {
+          const rawStatus = row.status ?? "orcado";
+          const normalizedStatus: MaterialStatus = rawStatus === "cotado" ? "orcado" : (rawStatus as MaterialStatus);
+
+          const material: MaterialItem = {
             id: String(row.id ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`),
             supabaseId: row.id != null ? String(row.id) : undefined,
             item: itemText,
             fornecedor: String(row.fornecedor ?? ""),
             valorCents: typeof row.preco_unitario === "number" ? Math.round(row.preco_unitario * 100) : 0,
-            status: (row.status as MaterialStatus) ?? "cotado",
+            status: normalizedStatus,
             quantidade: typeof row.quantidade === "number" ? row.quantidade : undefined,
+            unidade: String(row.unidade ?? ""),
             syncStatus: "synced",
           };
 
-          grouped[obraId] = grouped[obraId] ? [m, ...grouped[obraId]] : [m];
+          grouped[obraId] = grouped[obraId] ? [material, ...grouped[obraId]] : [material];
         });
 
         setMaterialsByProject((prev) => ({
@@ -805,8 +830,11 @@ export default function Home() {
     const whatsappDigits = normalizeWhatsAppNumber(form.whatsappCliente);
     const areaM2 = parseAreaM2(form.areaM2);
     const cubM2Cents = parseBRLToCents(form.cubM2);
-    const valorCents = parseBRLToCents(form.valorPrevisto);
-    const cubEstimateCents = areaM2 > 0 && cubM2Cents > 0 ? Math.round(areaM2 * cubM2Cents) : 0;
+    const valorPrevistoManualCents = parseBRLToCents(form.valorPrevisto);
+    const valorPrevistoCents =
+      valorPrevistoManualCents > 0 && Number.isFinite(valorPrevistoManualCents)
+        ? valorPrevistoManualCents
+        : Math.round(areaM2 * cubM2Cents);
     return (
       form.cliente.trim().length > 0 &&
       form.projeto.trim().length > 0 &&
@@ -815,7 +843,7 @@ export default function Home() {
       form.padraoCUB.trim().length > 0 &&
       areaM2 > 0 &&
       cubM2Cents > 0 &&
-      (valorCents > 0 || cubEstimateCents > 0) &&
+      valorPrevistoCents > 0 &&
       whatsappDigits.length >= 10
     );
   }, [
@@ -837,7 +865,7 @@ export default function Home() {
   const globalMaterialsToApproveCount = useMemo(() => {
     return Object.values(materialsByProject)
       .flat()
-      .filter((m) => m.status === "cotado").length;
+      .filter((m) => m.status === "orcado").length;
   }, [materialsByProject]);
 
   const globalMaterialsToFollowUpCount = useMemo(() => {
@@ -904,7 +932,7 @@ export default function Home() {
   }, [materialsSpentCents, teamSpentCents]);
 
   const materialsToApprove = useMemo(() => {
-    return currentMaterials.filter((m) => m.status === "cotado");
+    return currentMaterials.filter((m) => m.status === "orcado");
   }, [currentMaterials]);
 
   const materialsToFollowUp = useMemo(() => {
@@ -1142,7 +1170,7 @@ export default function Home() {
   function goToFirstPendingApprovals() {
     const first = recentProjects.find((p) => {
       const materials = materialsByProject[p.id] ?? [];
-      return materials.some((m) => m.status === "cotado" || m.status === "comprado");
+      return materials.some((m) => m.status === "orcado" || m.status === "comprado");
     });
     if (!first) return;
     setSelectedProjectId(first.id);
@@ -1243,16 +1271,22 @@ export default function Home() {
     const nomeObra = project?.projeto?.trim() ?? "";
     if (!nomeObra) throw new Error("Nome da obra ausente para sincronização (campo 'projeto').");
 
-    const rows = items
+    const rows = (items ?? [])
       .filter((it) => it.item.trim().length > 0)
-      .map((it) => ({
-        nome_obra: nomeObra,
-        nome_material: `${it.categoria}: ${it.item}`,
+      .map((it) => {
+        const qty = typeof it.quantidade === "number" && Number.isFinite(it.quantidade) ? it.quantidade : null;
+        const unit = it.unidade?.trim() ? it.unidade.trim() : null;
+        const suffixLocal = qty !== null ? ` (${qty}${unit ? ` ${unit}` : ""})` : "";
+
+        return {
+          nome_obra: nomeObra,
+          nome_material: `${it.categoria}: ${it.item}${suffixLocal}`,
         fornecedor: "Levantamento PDF",
         preco_unitario: 0,
         quantidade: typeof it.quantidade === "number" && Number.isFinite(it.quantidade) ? it.quantidade : 1,
-        status: "cotado" as MaterialStatus,
-      }));
+        status: "orcado" as MaterialStatus,
+        };
+      });
 
     if (rows.length === 0) return;
 
@@ -1269,18 +1303,19 @@ export default function Home() {
 
     const newMaterials: MaterialItem[] = levantamentoItems
       .filter((it) => it.item.trim().length > 0)
-      .map((it) => {
+      .map((it, index) => {
         const qty = typeof it.quantidade === "number" && Number.isFinite(it.quantidade) ? it.quantidade : null;
         const unit = it.unidade?.trim() ? it.unidade.trim() : null;
         const suffix = qty !== null ? ` (${qty}${unit ? ` ${unit}` : ""})` : "";
-        return {
-          id: String(Date.now()) + "-" + Math.random().toString(16).slice(2),
+        const material: MaterialItem = {
+          id: String(Date.now()) + "-" + index,
           item: `${it.categoria}: ${it.item}${suffix}`,
           fornecedor: "Levantamento PDF",
           valorCents: 0,
-          status: "cotado",
+          status: "orcado",
           contato: undefined,
         };
+        return material;
       });
 
     let savedOk = false;
@@ -1406,6 +1441,9 @@ export default function Home() {
   function saveMaterial() {
     if (!selectedProjectId) return;
     const valorCents = parseBRLToCents(materialForm.valor);
+    const quantidadeParsed = Number.parseFloat(String(materialForm.quantidade ?? "1").replace(",", "."));
+    const quantidade = Number.isFinite(quantidadeParsed) && quantidadeParsed > 0 ? quantidadeParsed : 1;
+    const unidade = String(materialForm.unidade ?? "un").trim() || "un";
     if (
       materialForm.item.trim().length === 0 ||
       materialForm.fornecedor.trim().length === 0 ||
@@ -1421,7 +1459,8 @@ export default function Home() {
       valorCents,
       status: materialForm.status,
       contato: materialForm.contato.trim() || undefined,
-      quantidade: 1,
+      quantidade,
+      unidade,
       syncStatus: "pending",
     };
 
@@ -1429,7 +1468,7 @@ export default function Home() {
       const current = prev[selectedProjectId] ?? [];
       return { ...prev, [selectedProjectId]: [material, ...current] };
     });
-    setMaterialForm({ item: "", fornecedor: "", valor: "", status: "cotado", contato: "" });
+    setMaterialForm({ item: "", fornecedor: "", quantidade: "1", unidade: "un", valor: "", status: "orcado", contato: "" });
 
     void (async () => {
       try {
@@ -1733,7 +1772,7 @@ export default function Home() {
                         <div className="text-sm font-medium text-zinc-600">
                           Existem <span className="font-semibold text-zinc-900">{materialsToApprove.length}</span> materiais aguardando aprovação
                         </div>
-                        <div className="mt-2 text-xs text-zinc-500">Status: Cotado (para aprovar).</div>
+                        <div className="mt-2 text-xs text-zinc-500">Status: Orçado (para aprovar).</div>
                       </div>
                       <div className="rounded-2xl border border-zinc-200 bg-white p-4">
                         <div className="text-sm font-medium text-zinc-600">
@@ -1762,7 +1801,7 @@ export default function Home() {
                                   <div className="text-sm font-semibold text-zinc-900">{m.item}</div>
                                   <div className="mt-1 text-xs text-zinc-600">Fornecedor: {m.fornecedor} · {formatCentsToBRL(m.valorCents)}</div>
                                 </div>
-                                <span className="rounded-full bg-[#D4AF37]/15 px-3 py-1 text-xs font-semibold text-zinc-900">Cotado</span>
+                                <span className="rounded-full bg-[#D4AF37]/15 px-3 py-1 text-xs font-semibold text-zinc-900">Orçado</span>
                               </div>
                             </div>
                           ))}
@@ -1944,7 +1983,7 @@ export default function Home() {
                   </div>
 
                   <form
-                    className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-6"
+                    className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-8"
                     onSubmit={(e) => {
                       e.preventDefault();
                       saveMaterial();
@@ -1963,13 +2002,31 @@ export default function Home() {
                       placeholder="Fornecedor"
                     />
                     <input
+                      value={materialForm.quantidade}
+                      onChange={(e) => setMaterialForm((s) => ({ ...s, quantidade: e.target.value }))}
+                      className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-right text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                      placeholder="Qtd"
+                      inputMode="decimal"
+                    />
+                    <select
+                      value={materialForm.unidade}
+                      onChange={(e) => setMaterialForm((s) => ({ ...s, unidade: e.target.value }))}
+                      className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
+                    >
+                      <option value="un">un</option>
+                      <option value="m">m</option>
+                      <option value="m²">m²</option>
+                      <option value="m³">m³</option>
+                      <option value="kg">kg</option>
+                    </select>
+                    <input
                       value={materialForm.valor}
                       onChange={(e) => {
                         const next = formatBRLInput(e.target.value);
                         setMaterialForm((s) => ({ ...s, valor: next.text }));
                       }}
                       className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
-                      placeholder="Valor"
+                      placeholder="Preço unitário"
                       inputMode="decimal"
                     />
                     <select
@@ -1977,17 +2034,17 @@ export default function Home() {
                       onChange={(e) => setMaterialForm((s) => ({ ...s, status: e.target.value as MaterialStatus }))}
                       className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
                     >
-                      <option value="cotado">Cotado</option>
+                      <option value="orcado">Orçado</option>
                       <option value="comprado">Comprado</option>
                       <option value="entregue">Entregue</option>
                     </select>
                     <input
                       value={materialForm.contato}
                       onChange={(e) => setMaterialForm((s) => ({ ...s, contato: e.target.value }))}
-                      className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20 md:col-span-3"
+                      className="h-11 rounded-xl border border-zinc-200 bg-white px-4 text-sm text-zinc-900 shadow-sm outline-none transition-colors placeholder:text-zinc-400 focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20 md:col-span-2"
                       placeholder="Contato (tel/WhatsApp)"
                     />
-                    <div className="md:col-span-3 md:flex md:justify-end">
+                    <div className="md:col-span-8 md:flex md:justify-end">
                       <button
                         type="submit"
                         className="h-11 w-full rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto"
@@ -2049,7 +2106,7 @@ export default function Home() {
                                 onChange={(e) => updateMaterialStatus(m.id, e.target.value as MaterialStatus)}
                                 className="h-9 rounded-xl border border-zinc-200 bg-white px-3 text-sm text-zinc-900 shadow-sm outline-none transition-colors focus:border-[#D4AF37] focus:ring-4 focus:ring-[#D4AF37]/20"
                               >
-                                <option value="cotado">Cotado</option>
+                                <option value="orcado">Orçado</option>
                                 <option value="comprado">Comprado</option>
                                 <option value="entregue">Entregue</option>
                               </select>
