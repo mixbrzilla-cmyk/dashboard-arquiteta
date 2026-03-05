@@ -3,7 +3,6 @@ import { setJobDone, setJobError, updateJob } from "./jobStore";
 
 import * as pdfParseModule from "pdf-parse";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import { createCanvas } from "@napi-rs/canvas";
 import { createWorker } from "tesseract.js";
 
 function clamp(n: number, min: number, max: number) {
@@ -123,6 +122,22 @@ async function extractTextFromPdf(buffer: Buffer) {
 }
 
 async function ocrPdfFirstPages(buffer: Buffer, pagesToOcr: number) {
+  type CanvasLike = {
+    getContext: (type: "2d") => unknown;
+    toBuffer: (type: string) => Buffer;
+  };
+  type CreateCanvasFn = (width: number, height: number) => CanvasLike;
+
+  let createCanvas: CreateCanvasFn | null = null;
+
+  try {
+    const moduleName = ["@napi-rs", "canvas"].join("/");
+    const canvasModule = (await import(moduleName)) as unknown as { createCanvas: CreateCanvasFn };
+    createCanvas = canvasModule.createCanvas;
+  } catch {
+    throw new Error("OCR indisponível neste ambiente de deploy. Use um PDF com texto selecionável ou rode localmente.");
+  }
+
   const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(buffer) });
   const pdf = await loadingTask.promise;
 
@@ -137,7 +152,7 @@ async function ocrPdfFirstPages(buffer: Buffer, pagesToOcr: number) {
       const page = await pdf.getPage(pageNumber);
       const viewport = page.getViewport({ scale: 2 });
 
-      const canvas = createCanvas(Math.ceil(viewport.width), Math.ceil(viewport.height));
+      const canvas = (createCanvas as CreateCanvasFn)(Math.ceil(viewport.width), Math.ceil(viewport.height));
       const ctx = canvas.getContext("2d");
 
       await (page as unknown as { render: (p: unknown) => { promise: Promise<unknown> } }).render({
