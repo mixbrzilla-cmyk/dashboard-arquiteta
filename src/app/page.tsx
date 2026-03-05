@@ -468,6 +468,24 @@ export default function Home() {
   const materialUpdateTimersRef = useRef<Record<string, number>>({});
   const teamUpdateTimersRef = useRef<Record<string, number>>({});
 
+  const materialFormRef = useRef<HTMLFormElement | null>(null);
+  const teamFormRef = useRef<HTMLFormElement | null>(null);
+  const newProjectFormRef = useRef<HTMLFormElement | null>(null);
+  const diarioFormRef = useRef<HTMLFormElement | null>(null);
+
+  function debugMobileTap(label: string) {
+    // TEMP: debug mobile touch/click
+    // eslint-disable-next-line no-console
+    console.log("Botão clicado!", label);
+    alert(`Clique disparado: ${label}`);
+  }
+
+  function submitFormFromTouch(form: HTMLFormElement | null, label: string) {
+    debugMobileTap(label);
+    if (!form) return;
+    form.requestSubmit();
+  }
+
   async function insertMaterialToSupabase(obraId: string, material: MaterialItem) {
     const supabase = getSupabase();
 
@@ -2267,7 +2285,8 @@ export default function Home() {
                   </div>
 
                   <form
-                    className="mt-6 grid grid-cols-1 gap-3"
+                    className="mt-6 flex flex-col gap-3"
+                    ref={diarioFormRef}
                     onSubmit={(e) => {
                       e.preventDefault();
                       saveDiarioEntry();
@@ -2288,7 +2307,15 @@ export default function Home() {
                     <div className="flex justify-end">
                       <button
                         type="submit"
-                        className="rounded-full bg-[#D4AF37] px-6 py-2.5 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                        className="pointer-events-auto relative z-[999] w-full touch-manipulation rounded-full bg-[#D4AF37] px-6 py-2.5 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                        onTouchEnd={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          submitFormFromTouch(diarioFormRef.current, "Diário de Obra: Salvar");
+                        }}
+                        onClick={() => {
+                          debugMobileTap("Diário de Obra: Salvar (click)");
+                        }}
                       >
                         Salvar
                       </button>
@@ -2371,6 +2398,7 @@ export default function Home() {
 
                   <form
                     className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-8"
+                    ref={materialFormRef}
                     onSubmit={(e) => {
                       e.preventDefault();
                       if (isSavingMaterial) return;
@@ -2436,8 +2464,16 @@ export default function Home() {
                       <button
                         type="submit"
                         disabled={isSavingMaterial}
+                        onTouchEnd={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          submitFormFromTouch(materialFormRef.current, "Materiais: Adicionar");
+                        }}
+                        onClick={() => {
+                          debugMobileTap("Materiais: Adicionar (click)");
+                        }}
                         className={
-                          "relative z-10 h-11 w-full touch-manipulation rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto " +
+                          "pointer-events-auto relative z-[999] h-12 w-full touch-manipulation rounded-xl bg-[#D4AF37] px-6 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:h-11 md:w-auto " +
                           (isSavingMaterial ? "opacity-70" : "")
                         }
                       >
@@ -2722,6 +2758,7 @@ export default function Home() {
 
                   <form
                     className="mt-6 grid grid-cols-1 gap-3 md:grid-cols-6"
+                    ref={teamFormRef}
                     onSubmit={(e) => {
                       e.preventDefault();
                       saveTeamMember();
@@ -2773,8 +2810,16 @@ export default function Home() {
                       <button
                         type="submit"
                         disabled={isSavingTeamMember}
+                        onTouchEnd={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          submitFormFromTouch(teamFormRef.current, "Equipe: Adicionar");
+                        }}
+                        onClick={() => {
+                          debugMobileTap("Equipe: Adicionar (click)");
+                        }}
                         className={
-                          "relative z-10 h-11 w-full touch-manipulation rounded-xl bg-[#D4AF37] px-4 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:w-auto " +
+                          "pointer-events-auto relative z-[999] h-12 w-full touch-manipulation rounded-xl bg-[#D4AF37] px-6 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2 md:h-11 md:w-auto " +
                           (isSavingTeamMember ? "opacity-70" : "")
                         }
                       >
@@ -3258,8 +3303,17 @@ export default function Home() {
                 <div className="flex flex-col items-end gap-3 sm:flex-row sm:items-center">
                   <button
                     type="button"
-                    onClick={openModal}
-                    className="inline-flex items-center justify-center rounded-full bg-[#D4AF37] px-5 py-2.5 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
+                    onTouchEnd={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      debugMobileTap("Dashboard: Novo Projeto");
+                      openModal();
+                    }}
+                    onClick={() => {
+                      debugMobileTap("Dashboard: Novo Projeto (click)");
+                      openModal();
+                    }}
+                    className="pointer-events-auto relative z-[999] inline-flex min-h-12 items-center justify-center rounded-xl bg-[#D4AF37] px-6 py-3 text-sm font-semibold text-zinc-900 shadow-sm transition-colors hover:bg-[#C9A533] active:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#D4AF37] focus-visible:ring-offset-2"
                   >
                     Novo Projeto
                   </button>
@@ -3500,6 +3554,7 @@ export default function Home() {
 
                   <form
                     className="mt-4 flex max-h-[calc(100vh-11rem)] flex-col gap-3 overflow-y-auto pr-1"
+                    ref={newProjectFormRef}
                     onSubmit={(e) => {
                       e.preventDefault();
                       if (!canSave) return;
